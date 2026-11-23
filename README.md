@@ -1,28 +1,25 @@
-<h1 align="center">Tokyo 1980</h1>
+<h1 align="center">TokyoRT</h1>
 
-<p align="center"><b>All of Shinjuku in a late-Shōwa look, streamed by level of detail around a camera you fly, path-traced in real time with <a href="https://github.com/meshy-dev/ThreeRT">ThreeRT</a>. No baked lighting.</b></p>
+<p align="center"><b>All of Shinjuku, streamed by level of detail around a camera you fly, path-traced in real time with <a href="https://github.com/meshy-dev/ThreeRT">ThreeRT</a>. No baked lighting.</b></p>
 
 <p align="center">
-  <img src="docs/img/alley-night.jpg" width="100%" alt="A narrow bar alley at night after rain: lit signs, paper lanterns and door lamps reflected in the wet asphalt">
+  <img src="docs/img/towers-day.jpg" width="100%" alt="The West Shinjuku towers by day, seen from above: office towers, the streets between them and the city to the horizon">
 </p>
 
 Every building stands where it stands in Shinjuku: footprints, heights and uses come from Japan's open 3D city model
 ([Project PLATEAU](https://www.mlit.go.jp/plateau/)), streets and power lines from OpenStreetMap, the ground from GSI.
-On top of that, rules written in TypeScript dress each building for the 1980s: tile-clad mixed-use blocks, aluminium
-sashes, balconies and penthouses, shopfronts and fascias, sign towers, neon, and at street level the bars of
+On top of that, rules written in TypeScript dress each building in a late-Shōwa look: tile-clad mixed-use blocks,
+aluminium sashes, balconies and penthouses, shopfronts and fascias, sign towers, neon, and at street level the bars of
 Golden Gai with their lightboxes, noren, lanterns, gas meters, crates and bicycles. 240 made-up shops each keep one
 name across all their signs. Nothing is lit in advance: every light, shadow, reflection and bounce is traced as you fly.
 
 <p align="center">
-  <img src="docs/img/bar-night.jpg" width="49.5%" alt="Bar fronts up close at night: plaster walls, door lamps, lightboxes, a gas cylinder and potted plants on the wet street">
-  <img src="docs/img/alley-day.jpg" width="49.5%" alt="The same alley by day: plaster and tile, eaves, lanterns and potted plants in shade">
-  <img src="docs/img/street-night.jpg" width="49.5%" alt="A wider street at night: lit shopfronts and offices, a street lamp, wet asphalt">
-  <img src="docs/img/towers-day.jpg" width="49.5%" alt="The West Shinjuku towers by day from above">
+  <img src="docs/img/skyline-day.jpg" width="100%" alt="Shinjuku by day from high in the east: the low city in the foreground, the West Shinjuku skyline behind it in the haze">
   <img src="docs/img/aerial-night.jpg" width="100%" alt="Shinjuku at night from above: thousands of lit windows, sign towers and streets">
 </p>
 
-<sub>These are the offline path tracer's frames of the scene (256 or 192 samples a pixel, denoised). The live view
-renders the same scene at 0.5–0.6 resolution scale with temporal accumulation: noisier in motion, the same light.</sub>
+<sub>Frames of the offline path tracer (128–192 samples a pixel, denoised). The live view renders the same scene at
+0.5–0.6 resolution scale with temporal accumulation: noisier in motion, the same light.</sub>
 
 ## Run it
 
@@ -31,7 +28,7 @@ about 30 GB of disk and the system's Japanese fonts (Hiragino, drawn into the si
 about 10 minutes on an M3 Max, plus the downloads (~1.5 GB from PLATEAU, OpenStreetMap, GSI and Poly Haven).
 
 ```bash
-git clone --recursive https://github.com/threert/tokyo-1980 && cd tokyo-1980
+git clone --recursive https://github.com/threert/TokyoRT && cd TokyoRT
 tools/setup.sh          # engine, downloads, the compiled city, its far level, every dressed cell
 tools/demo.sh night     # or day / dusk; add a start point, e.g. tools/demo.sh night 360,-496
 ```

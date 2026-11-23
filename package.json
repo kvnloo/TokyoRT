@@ -1,9 +1,9 @@
 {
-  "name": "tokyo-1980",
+  "name": "tokyort",
   "private": true,
   "license": "MIT",
   "type": "module",
-  "description": "Tokyo in a 1980s look, the whole of Shinjuku streamed by level of detail around a flying camera, path-traced live with ThreeRT.",
+  "description": "All of Shinjuku, streamed by level of detail around a flying camera, path-traced in real time with ThreeRT.",
   "scripts": {
     "setup": "sh tools/setup.sh",
     "demo": "sh tools/demo.sh",
