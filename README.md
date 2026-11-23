@@ -3,7 +3,7 @@
 <p align="center"><b>All of Shinjuku, streamed by level of detail around a camera you fly, path-traced in real time with <a href="https://github.com/meshy-dev/ThreeRT">ThreeRT</a>. No baked lighting.</b></p>
 
 <p align="center">
-  <img src="docs/img/towers-day.jpg" width="100%" alt="The West Shinjuku towers by day, seen from above: office towers, the streets between them and the city to the horizon">
+  <img src="docs/img/skyline-day.jpg" width="100%" alt="Shinjuku by day from high in the east: the low city in the foreground, the West Shinjuku skyline behind it in the haze">
 </p>
 
 Every building stands where it stands in Shinjuku: footprints, heights and uses come from Japan's open 3D city model
@@ -14,7 +14,6 @@ Golden Gai with their lightboxes, noren, lanterns, gas meters, crates and bicycl
 name across all their signs. Nothing is lit in advance: every light, shadow, reflection and bounce is traced as you fly.
 
 <p align="center">
-  <img src="docs/img/skyline-day.jpg" width="100%" alt="Shinjuku by day from high in the east: the low city in the foreground, the West Shinjuku skyline behind it in the haze">
   <img src="docs/img/aerial-night.jpg" width="100%" alt="Shinjuku at night from above: thousands of lit windows, sign towers and streets">
 </p>
 
