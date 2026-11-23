@@ -1,0 +1,24 @@
+{
+  "name": "tokyo-1980",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Tokyo in a 1980s look, the whole of Shinjuku streamed by level of detail around a flying camera, path-traced live with ThreeRT.",
+  "scripts": {
+    "setup": "sh tools/setup.sh",
+    "demo": "sh tools/demo.sh",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@threert/gameplay": "file:engine/packages/gameplay",
+    "@threert/scene": "file:engine/packages/scene",
+    "earcut": "^3.2.4",
+    "pngjs": "^7.0.0",
+    "polygon-clipping": "^0.15.7",
+    "sharp": "^0.35.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}
