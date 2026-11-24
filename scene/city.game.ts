@@ -32,7 +32,7 @@ const AREA = "shinjuku";
 const BAKED = `assets/city/baked/${AREA}`;
 const CELL = 128;
 /** Level radii (m, from the camera to the cell's box) and the margin a level is kept beyond them. */
-const KEEP = 50;
+let KEEP = 50;
 let R0 = 140, R1 = 480;
 /** Triangles added in place per frame (the commit pays ~80 ns a triangle), and the frame script's time for it (ms). */
 const FRAME_TRIS = 50_000, FRAME_MS = 5, FRAME_OBJECTS = 30;
@@ -73,11 +73,21 @@ const midGlow = new MaterialFunction("TokyoMidGlow", {
 const ROOM_DAY = { room: 1300, shop: 2500 };
 // The far tile already has each window, sign and lamp in its night nodes. Keep that geometry resident.
 // Unlit glTF materials carry their authored glow as base colour. Restore their daylight surfaces when power is off.
+// By day a far window is the pane in front of a room, as the near levels' windows are: the room at the brightness it has
+// there through the glass (`customData[0]`, nits: 0 by night, when the lit ones are the night nodes' own), so a building
+// does not change its tone between the mid level and the far one. Live: the time of day sets it on the far models.
 const farWindows = new MaterialFunction("TokyoFarGlass", {
   code: `if (i.power < 0.5) {
-    o.base = vec3<f32>(0.02, 0.022, 0.025); o.emissive = vec3<f32>(0.0); o.specular = 0.5;
+    o.base = vec3<f32>(0.02, 0.022, 0.025); o.specular = 0.5;
+    o.emissive = vec3<f32>(1.0, 0.93, 0.82) * i.custom.x;
   }`,
 }).with();
+const farRooms = new MaterialFunction("TokyoFarRoom", {
+  code: `o.emissive = vec3<f32>(1.0, 0.93, 0.82) * i.custom.x;`,
+}).with();
+/** A far window's room by day (nits, through its pane): set where the skyline's 480 m switch changed least (0, 150,
+ *  300, 500 nits: mean ΔE 0.68, 0.63, 0.60, 0.59). */
+const FAR_ROOM_DAY = 300;
 const farSigns = new MaterialFunction("TokyoFarSign", {
   code: `if (i.power < 0.5) {
     var paper = vec3<f32>(1.0);
@@ -425,6 +435,25 @@ function tourAt(t: number): { pos: V3; yaw: number } {
   return { pos: [a[1] + (b[1] - a[1]) * s, a[2] + (b[2] - a[2]) * s, a[3] + (b[3] - a[3]) * s], yaw: (a[4] + (b[4] - a[4]) * s) * (Math.PI / 180) };
 }
 
+// ---------------------------------------------------------------- measurement (tools/tokyo/quality.ts)
+// Events a script sends to hold the city at a pose and compare frames ("event" commands of `threert-render live`):
+//   pose {pos: [x, y, z], yaw, pitch} (degrees): the camera there (a tour stops); radii {r0, r1, keep} (m): the level
+//   radii and their hysteresis; hold: the camera and the streaming stop where they are (a tour's pose is logged);
+//   settle: every cell to its level now, whole (logged "tokyo: settled" when done).
+let held = false;
+function settle() {
+  for (let n = 0; n < 100_000; n++) {
+    let busy = false;
+    for (const c of cells.values()) if (c.loading || (want(c, ...cam.pos) >= 0 && want(c, ...cam.pos) !== c.level) || (c.level >= 0 && want(c, ...cam.pos) < 0)) busy = true;
+    if (!busy) break;
+    stream(cam.pos[0], cam.pos[1], cam.pos[2], { tris: Infinity, until: Infinity, objects: Infinity });
+  }
+  retire(Infinity);
+  const n = [0, 1].map((l) => [...cells.values()].filter((c) => c.level === l).length);
+  console.log(`tokyo: settled with ${n[0]} cells at L0, ${n[1]} at L1 (r0 ${R0}, r1 ${R1}, keep ${KEEP})`);
+}
+const deg = (r: number) => +(r * 180 / Math.PI).toFixed(3);
+
 // ---------------------------------------------------------------- the scene
 let tour = false;
 function collectMaterials(M: ReturnType<typeof heroMaterials>, P: ReturnType<typeof propMaterials>, night: boolean) {
@@ -466,6 +495,7 @@ function setTime(next: Time, camera: PerspectiveCamera) {
       mat.shader = midGlow.with({ ...binding.params, IsNight: night ? 1 : 0 }, binding.textures);
     }
     for (const f of farQ.values()) if (f.lights && !f.covered) f.lights.power = night ? 1 : 0;
+    for (const f of farQ.values()) for (const m of [f.base, f.lights]) if (m) m.customData = [night ? 0 : FAR_ROOM_DAY, 0, 0, 0];
   }
   console.log(`Tokyo · ${time} · 1 Day / 2 Dusk / 3 Night / T Cycle`);
 }
@@ -515,8 +545,9 @@ export function sceneFor(room: string) {
       const model = (names: string[], lights = false) => {
         const nodes = names.filter((n) => has.has(n));
         if (!nodes.length) return null;
-        const m = new GLTFModel(uri, { nodes, ...(lights ? { functions: { "window lit far ": farWindows, "signs night ": farSigns } } : {}) });
+        const m = new GLTFModel(uri, { nodes, functions: lights ? { "window lit far ": farWindows, "signs night ": farSigns } : { "window glass": farRooms } });
         if (lights && !night) m.power = 0;
+        m.customData = [night ? 0 : FAR_ROOM_DAY, 0, 0, 0];
         scene.add(m);
         return m;
       };
@@ -631,6 +662,27 @@ export default defineGame<Record<string, never>>({
     dusk: (world) => setTime("dusk", world.camera),
     night: (world) => setTime("night", world.camera),
     cycleTime: (world) => setTime(time === "day" ? "dusk" : time === "dusk" ? "night" : "day", world.camera),
+    pose: (world, ev: { pos: V3; yaw: number; pitch: number }) => {
+      tour = false;
+      cam.pos = [...ev.pos];
+      cam.yaw = ev.yaw * Math.PI / 180;
+      cam.pitch = ev.pitch * Math.PI / 180;
+      aim(world.camera);
+    },
+    radii: (_world, ev: { r0?: number; r1?: number; keep?: number }) => {
+      if (ev.r0 !== undefined) R0 = ev.r0;
+      if (ev.r1 !== undefined) R1 = ev.r1;
+      if (ev.keep !== undefined) KEEP = ev.keep;
+    },
+    hold: () => {
+      tour = false;
+      held = true;
+      console.log(`tokyo: held at ${cam.pos.map((v) => +v.toFixed(3)).join(",")} look ${deg(cam.yaw)},${deg(cam.pitch)}`);
+    },
+    settle: () => {
+      held = false;
+      settle();
+    },
   },
   pointer: "look",
   setup(ctx) {
@@ -657,6 +709,7 @@ export default defineGame<Record<string, never>>({
       cam.pos = [cam.pos[0] + (fx * mv.y + rx * mv.x) * v, Math.max(18, cam.pos[1] + (fy * mv.y + up) * v), cam.pos[2] + (fz * mv.y + rz * mv.x) * v];
     }
     aim(f.camera);
+    if (held) return;
     retire(250);
     stream(cam.pos[0], cam.pos[1], cam.pos[2], { tris: FRAME_TRIS, until: Date.now() + FRAME_MS, objects: FRAME_OBJECTS });
   },
