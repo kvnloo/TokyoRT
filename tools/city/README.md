@@ -14,6 +14,8 @@ tiles into geometry. Imported from [jeantimex/tokyo](https://github.com/jeantime
 - no photographs or scanned models: `fetch.mjs` downloads PLATEAU's buildings and roads only (not their photo textures,
   bridges, street furniture or trees) and no GSI aerial photos, and `compile.mjs` keeps the LOD2 shells without their
   photo coordinates (`photos.mjs` and `meshes.mjs` are gone). The mesher colours those buildings itself.
+- the tests check every compiled area (upstream: Shibuya's tiles, and Tokyo's and Shiba's road markings), and the tile
+  format's round trip covers LOD2 surfaces, walls and signs.
 
 ## Use
 
@@ -23,7 +25,8 @@ tiles into geometry. Imported from [jeantimex/tokyo](https://github.com/jeantime
 node tools/tokyo/prefetch-plateau.mjs --area=shinjuku                               # PLATEAU with curl (fetch.mjs then skips it)
 node tools/city/pipeline/fetch.mjs --area=shinjuku                                  # raw data -> assets/city/raw/shinjuku
 node --max-old-space-size=8192 tools/city/pipeline/compile.mjs --area=shinjuku     # -> assets/city/tiles/shinjuku
-node tools/city/tests/tileformat.test.mjs                                           # the tile format's round trip
+npm test                                                                           # the tile format, road markings
+                                                                                   # (and the compiled areas, if any)
 ```
 
 Areas (`pipeline/config.mjs`): tokyo, shiba, shibuya, shinjuku, chiyoda, chuo, fujinomiya. Each is about 3.4 × 2.8 km.
