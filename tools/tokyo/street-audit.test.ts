@@ -3,7 +3,7 @@
 //   node tools/tokyo/street-audit.test.ts
 import assert from "node:assert/strict";
 import { AREA, PROP, DECAL } from "../city/shared/tileformat.js";
-import { audit, diffReports, parseRig, type Tile } from "./street-audit.ts";
+import { audit, buildingClass, diffReports, parseBuildingCode, parseRig, streetBuildings, type Tile } from "./street-audit.ts";
 
 const ring = (pts: number[][]) => Float32Array.from(pts.flat());
 /** A quad along +x: from x0 to x1, centred on z, w wide. */
@@ -107,3 +107,40 @@ const gone = diffReports(before, { rows: after.rows.slice(0, 2), furniture: [] }
 assert.match(gone, /\| stop-line \| \(row gone\) \|/);
 assert.match(gone, /^5 of 5 rows changed, 2 now within standard, 2 no longer$/m); // stop-line, vending gone
 console.log("street-audit diff: ok");
+
+// the buildings of 6h: the classification alone, with no tile data
+assert.deepEqual(buildingClass(412, 5, 15), { use: "flats", storeys: 5, rise: "mid", estimated: false });
+assert.deepEqual(buildingClass(461, 255, 40), { use: "unknown", storeys: 13, rise: "high", estimated: true }); // 40 m at 3.1 m a storey
+assert.deepEqual(buildingClass(0, 0, NaN), { use: "unknown", storeys: 1, rise: "low", estimated: true });
+assert.equal(buildingClass(414, 2, 7).use, "shopHouses");
+assert.equal(buildingClass(402, 9, 30).rise, "high");
+assert.equal(buildingClass(411, 3, 9).rise, "mid");
+const noCode = parseBuildingCode("", "");
+assert.deepEqual(noCode, { smallHeight: null, smallStoreys: null, smallWalls: null, bigWalls: null });
+const empty = streetBuildings([], [], null, noCode);
+assert.equal(empty.find((r) => r.id === "bldg-use")!.verdict, "no data");
+assert.equal(empty.find((r) => r.id === "bldg-garage")!.verdict, "none in the code");
+// the dressing code in the shape dress.ts and materials.ts have it: one small finish of each kind by weight, big ones alike
+const code = parseBuildingCode("    const small = b.height < 14 && (b.storeys < 5 || b.storeys === 255);",
+  '  const walls = [\n    finish("a", 1, { name: "wall stucco cream" }),\n    finish("b", 1, { name: "wall tiles brown" }),\n  ];\n  const wallWeights = [3, 1];\n' +
+  '  const bigWalls = [\n    finish("c", 1, { name: "big tiles cream" }),\n    finish("d", 1, { name: "big painted concrete" }),\n  ];\n');
+assert.deepEqual(code, { smallHeight: 14, smallStoreys: 5, smallWalls: { render: 0.75, tile: 0.25 }, bigWalls: { tile: 0.5, concrete: 0.5 } });
+// a five-storey block of flats beside the residential road, its long wall to the road; a small one; an office set back 30 m
+const box = (x0: number, z0: number, x1: number, z1: number) => [[ring([[x0, z0], [x1, z0], [x1, z1], [x0, z1]])]];
+const bt: Tile[] = [{ areas: [], props: [], wires: new Float32Array(), buildings: [
+  { usage: 412, storeys: 5, height: 16, hint: 0, polygons: box(10, 6, 30, 14) },
+  { usage: 412, storeys: 3, height: 9, hint: 2 << 24, polygons: box(40, 6, 46, 20) },
+  { usage: 401, storeys: 4, height: 14, hint: 0, polygons: box(60, 30, 80, 40) },
+] }];
+const bs = streetBuildings(bt, [{ highway: "residential", pts: [0, 0, 0, 100, 0, 0] }], null, code);
+const brow = (id: string) => bs.find((r) => r.id === id)!;
+assert.equal(brow("bldg-use").values.count, 2);
+assert.equal(brow("bldg-use").values.flats, 2);
+assert.equal(brow("bldg-mid-flats").values.count, 2);
+assert.equal(brow("bldg-mid-flats").values.small, 1);
+assert.equal(brow("bldg-mid-flats").values.longestFaces, 1); // the small one's long wall runs away from the road
+near(brow("bldg-balconies").values.towardRoad, 0.5, 1e-9, "flats with balconies toward the road");
+near(brow("bldg-facade").values.tile, (0.25 + 0.5) / 2, 1e-9, "tile share");
+assert.equal(brow("bldg-facade").values.mapped, 1);
+assert.equal(brow("bldg-facade").verdict, "no metal panel");
+console.log("street-audit buildings: ok");

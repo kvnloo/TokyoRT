@@ -16,7 +16,9 @@
 // (id, item, standard, source, measured numbers, unit, verdict) beside the Markdown; `--diff` lists the rows whose
 // numbers or verdict changed between two such files: the before / after of a change to the street. Always exits 0.
 // Below the standards' rows, the street furniture of 6h along minor roads: what the tiles hold per km, and what they
-// do not hold at all ("none in the data").
+// do not hold at all ("none in the data"). Below that, the buildings of 6h along minor roads: how many by use and
+// storeys (from the tiles), and what the street level gives the mid-rise flats (from the dressing code: "none in the
+// code" where it has no such feature).
 import { readFileSync, readdirSync, existsSync, realpathSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { repoRoot } from "../lib/paths.ts";
@@ -25,7 +27,8 @@ import { PolyIndex, forEachAlong } from "../city/pipeline/landscape.mjs";
 import { decalMesh } from "../city/mesh/decals.js";
 
 export type Box = { minX: number; minZ: number; maxX: number; maxZ: number };
-export type Tile = { areas: { kind: number; polygons: ArrayLike<number>[][] }[]; props: { kind: number; variant: number; rot: number; x: number; z: number }[]; wires: ArrayLike<number> };
+export type Tile = { areas: { kind: number; polygons: ArrayLike<number>[][] }[]; props: { kind: number; variant: number; rot: number; x: number; z: number }[]; wires: ArrayLike<number>;
+  buildings?: { usage?: number; storeys: number; height: number; hint?: number; polygons: ArrayLike<number>[][] }[] };
 export type Edge = { highway: string; oneway?: number; bridge?: number; tunnel?: number; pts: number[] };
 /** The near and far pole models, as their source builds them (null where the source no longer has that shape). */
 export type Rig = { poleHeight: number | null; conductors: number[] | null; sag: [number, number] | null; nearLamp: number | null; farPoleHeight: number | null; farLamp: number | null };
@@ -36,12 +39,14 @@ export type Input = {
   /** a DECAL variant's cell on the road, [across, along] metres */
   cell: (variant: number) => [number, number];
   bbox?: Box | null;
+  /** what the dressing code gives a building (parseBuildingCode); the buildings section is left out without it */
+  code?: BuildingCode;
 };
 /** A row of the report. `standard` and `measured` are the Markdown's text; `source` names the document the standard comes
  * from; `values` are the measured numbers (null where there was nothing to measure), `unit` the unit of the lengths among
  * them (counts, shares and per-km figures say so in their names). */
 export type Row = { id: string; item: string; standard: string; source: string; measured: string; value: number | null; values: Record<string, number | null>; unit: string; verdict: string };
-export type Report = { rows: Row[]; furniture: Row[]; edgeLines: { cls: string; width: string; km: number; anySide: number; bothSides: number }[]; spacing: { bin: string; n: number }[]; decals: Record<string, number> };
+export type Report = { rows: Row[]; furniture: Row[]; buildings?: Row[]; edgeLines: { cls: string; width: string; km: number; anySide: number; bothSides: number }[]; spacing: { bin: string; n: number }[]; decals: Record<string, number> };
 
 const CELL_W = 256, CELL_H = 512; // the atlas cell in texels (tools/tokyo/decals.ts)
 const MINOR = new Set(["residential", "unclassified", "living_street"]);
@@ -283,9 +288,124 @@ export function streetFurniture(tiles: Tile[], edges: Edge[], bbox: Box | null |
   return rows;
 }
 
+// ---------------------------------------------------------------- the buildings of 6h, along minor roads
+const FRONTING = 10; // a building fronts a minor road if its outline comes within this many metres of the centreline
+/** PLATEAU's building use codes (bldg:usage, the 3D city model's Building_usage code list), in the groups 6h needs. */
+export const USES = { flats: [412], houses: [411, 415], shopHouses: [413, 414], commercial: [401, 402, 403, 404], public: [421, 422, 431, 441, 451, 452, 453, 454] } as const;
+export type Use = keyof typeof USES | "unknown";
+/** A building's use group and storey band (low 1-2, mid 3-8, high 9+). Storeys are PLATEAU's where recorded (1-59, as
+ * scene/hero/dress.ts takes them), else estimated from the height at 3.1 m a storey as the dressing does. */
+export function buildingClass(usage: number, storeys: number, height: number): { use: Use; storeys: number; rise: "low" | "mid" | "high"; estimated: boolean } {
+  const use = (Object.keys(USES) as (keyof typeof USES)[]).find((k) => (USES[k] as readonly number[]).includes(usage)) ?? "unknown";
+  const recorded = storeys >= 1 && storeys < 60, n = recorded ? storeys : Math.max(1, Math.round((Number.isFinite(height) ? height : 0) / 3.1));
+  return { use, storeys: n, rise: n <= 2 ? "low" : n <= 8 ? "mid" : "high", estimated: !recorded };
+}
+
+/** What the dressing code gives a building, read from its source (null where the source no longer has that shape):
+ * the size under which a building is dressed as a small one (dress.ts `small`), and the wall finishes the near levels
+ * draw for small and for bigger buildings, as shares by kind (tile, render, concrete, metal panel, sheet, timber). */
+export type BuildingCode = { smallHeight: number | null; smallStoreys: number | null; smallWalls: Record<string, number> | null; bigWalls: Record<string, number> | null };
+// (corrugated sheet, a small house's cladding, is not the metal panel of a block of flats)
+const finishKind = (name: string) => (/tile/.test(name) ? "tile" : /concrete/.test(name) ? "concrete" : /panel|alumin/.test(name) ? "metal panel" : /sheet/.test(name) ? "sheet" : /stucco|plaster|mortar/.test(name) ? "render" : /cedar|plank|timber/.test(name) ? "timber" : "other");
+export function parseBuildingCode(dress: string, materials: string): BuildingCode {
+  const small = /const small = b\.height < ([\d.]+) && \(b\.storeys < (\d+)/.exec(dress);
+  const names = (list: string) => { const m = new RegExp(`const ${list} = \\[([\\s\\S]*?)\\n\\s*\\];`).exec(materials); return m ? [...m[1].matchAll(/name: "([^"]+)"/g)].map((x) => x[1]) : null; };
+  const shares = (ns: string[] | null, w: number[] | null) => {
+    if (!ns?.length || (w && w.length !== ns.length)) return null;
+    const out: Record<string, number> = {}, sum = w ? w.reduce((s, v) => s + v, 0) : ns.length;
+    ns.forEach((n, i) => { const k = finishKind(n); out[k] = (out[k] ?? 0) + (w ? w[i] : 1) / sum; });
+    return out;
+  };
+  const wm = /const wallWeights = \[([^\]]*)\]/.exec(materials), weights = wm ? wm[1].split(",").map(Number) : null;
+  return { smallHeight: small ? Number(small[1]) : null, smallStoreys: small ? Number(small[2]) : null, smallWalls: shares(names("walls"), weights), bigWalls: shares(names("bigWalls"), null) };
+}
+
+/** The buildings along the minor roads, by use and storeys, and for the mid-rise flats what their street level has: the
+ * counts read from the tiles, the features read from the dressing code (scene/hero/dress.ts and materials.ts, the near
+ * levels; tools/city/mesh/meshing.js, the far level). A building counts if its centroid is in the box and its outline
+ * comes within FRONTING metres of a minor road's centreline (bridges and tunnels left out). */
+export function streetBuildings(tiles: Tile[], edges: Edge[], bbox: Box | null | undefined, code: BuildingCode): Row[] {
+  const samples: { x: number; z: number; minor: boolean }[] = [];
+  for (const e of edges) {
+    const minor = MINOR.has(e.highway) && !e.bridge && !e.tunnel;
+    const pts: [number, number][] = [];
+    for (let i = 0; i + 2 < e.pts.length; i += 3) pts.push([e.pts[i], e.pts[i + 2]]);
+    forEachAlong(pts, STEP, (x: number, z: number) => { samples.push({ x, z, minor }); });
+  }
+  const km = samples.filter((p) => p.minor && inBox(bbox, p.x, p.z)).length * STEP / 1000;
+  const grid = new Grid(16, samples);
+  const minorNear = (x: number, z: number, r: number) => grid.near(x, z, r).some((p) => p.minor);
+  const nearestMinor = (x: number, z: number, r: number) => { let best = Infinity, minor = false; for (const p of grid.near(x, z, r)) { const d = Math.hypot(p.x - x, p.z - z); if (d < best) { best = d; minor = p.minor; } } return minor; };
+  type B = { use: Use; rise: string; estimated: boolean; small: boolean; faces: boolean; mapped: number };
+  const found: B[] = [];
+  for (const t of tiles) for (const b of t.buildings ?? []) {
+    const poly = b.polygons.reduce<ArrayLike<number> | null>((best, rings) => (rings[0] && (!best || rings[0].length > best.length) ? rings[0] : best), null);
+    if (!poly || poly.length < 6) continue;
+    const pts: [number, number][] = [];
+    for (let i = 0; i + 1 < poly.length; i += 2) pts.push([poly[i], poly[i + 1]]);
+    const cx = pts.reduce((s, p) => s + p[0], 0) / pts.length, cz = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+    if (!inBox(bbox, cx, cz)) continue;
+    let fronts = false;
+    forEachAlong([...pts, pts[0]], STEP, (x: number, z: number) => { if (!fronts && minorNear(x, z, FRONTING)) fronts = true; });
+    if (!fronts) continue;
+    const c = buildingClass(b.usage ?? 0, b.storeys, b.height);
+    // the longest wall (where the near level puts an apartment's balconies, dress.ts styleOf): does it face the minor road?
+    let li = 0, ll = 0;
+    pts.forEach((p, i) => { const q = pts[(i + 1) % pts.length], l = Math.hypot(q[0] - p[0], q[1] - p[1]); if (l > ll) { ll = l; li = i; } });
+    const [ax, az] = pts[li], [bx, bz] = pts[(li + 1) % pts.length], mx = (ax + bx) / 2, mz = (az + bz) / 2;
+    let nx = -(bz - az) / (ll || 1), nz = (bx - ax) / (ll || 1);
+    if (insideRing(pts, mx + nx * 0.05, mz + nz * 0.05)) { nx = -nx; nz = -nz; }
+    let faces = false;
+    for (let d = 1; d <= FRONTING + 2 && !faces; d++) { const x = mx + nx * d, z = mz + nz * d; if (grid.near(x, z, 2.5).length) { faces = nearestMinor(x, z, 2.5); break; } }
+    const small = code.smallHeight != null && code.smallStoreys != null && b.height < code.smallHeight && (b.storeys < code.smallStoreys || b.storeys === 255);
+    found.push({ use: c.use, rise: c.rise, estimated: c.estimated, small, faces, mapped: ((b.hint ?? 0) >>> 24) & 15 });
+  }
+  const rows: Row[] = [];
+  const row = (id: string, item: string, measured: string, values: Record<string, number>, verdict: string, unit: string, source = "-") => {
+    const v = Object.values(values)[0];
+    rows.push({ id, item, standard: NO_STANDARD, source, measured, value: Number.isFinite(v) ? v : null,
+      values: Object.fromEntries(Object.entries(values).map(([k, x]) => [k, Number.isFinite(x) ? x : null])), unit, verdict });
+  };
+  const n = found.length, pc = (k: number, of = n) => f(of ? (k / of) * 100 : NaN, 0) + "%";
+  const by = (use: Use) => found.filter((b) => b.use === use).length;
+  const uses: [Use, string][] = [["flats", "flats (412 共同住宅)"], ["houses", "houses (411, 415)"], ["shopHouses", "shops with homes (413, 414)"], ["commercial", "commercial (401-404)"], ["public", "public and other (421-454)"], ["unknown", "unknown (461 or none)"]];
+  row("bldg-use", "Buildings fronting minor roads, by use", `${n} buildings (${f(km > 0 ? n / km : NaN, 1)} per km): ${uses.map(([k, s]) => `${s} ${by(k)} (${pc(by(k))})`).join(", ")}`,
+    { count: n, perKm: km > 0 ? n / km : NaN, ...Object.fromEntries(uses.map(([k]) => [k, by(k)])) }, n ? "measured" : "no data", "count", "PLATEAU bldg:usage (Building_usage code list)");
+  const rise = (r: string, list = found) => list.filter((b) => b.rise === r).length, est = found.filter((b) => b.estimated).length;
+  row("bldg-storeys", "Buildings fronting minor roads, by storeys", `low 1-2: ${rise("low")} (${pc(rise("low"))}), mid 3-8: ${rise("mid")} (${pc(rise("mid"))}), high 9+: ${rise("high")} (${pc(rise("high"))}); ${est} with storeys estimated from the height`,
+    { low: rise("low"), mid: rise("mid"), high: rise("high"), estimated: est }, n ? "measured" : "no data", "count", "PLATEAU bldg:storeysAboveGround");
+  const flats = found.filter((b) => b.use === "flats" && b.rise === "mid"), m = flats.length;
+  const small = flats.filter((b) => b.small).length, faces = flats.filter((b) => b.faces).length, bigFacing = flats.filter((b) => !b.small && b.faces).length;
+  const smallRule = code.smallHeight != null ? `under ${code.smallHeight} m and ${code.smallStoreys} storeys` : "(the small-building rule was not found in scene/hero/dress.ts)";
+  row("bldg-mid-flats", "Mid-rise flats (412, 3-8 storeys) fronting minor roads", `${m} (${pc(m)} of the buildings, ${f(km > 0 ? m / km : NaN, 1)} per km); ${small} of them ${smallRule}, dressed at street level (L0, within 140 m) as a small building (dress.ts:219, 286: dressSmall's bar units, no balconies) and further off (L1) as a mid one; the longest wall faces the minor road on ${faces} (${pc(faces, m)})`,
+    { count: m, share: n ? m / n : NaN, perKm: km > 0 ? m / km : NaN, small, longestFaces: faces }, m ? "measured" : "no data", "count");
+  row("bldg-balconies", "Balconies on the mid-rise flats", `on ${bigFacing} of ${m} (${pc(bigFacing, m)}) toward the minor road at street level (L0), on ${faces} (${pc(faces, m)}) at L1: the near levels put them on the longest wall only (dress.ts:1062), a 1.1 m slab with a frosted panel, aluminium bars or a solid parapet by building (dress.ts:1203-1211), an outdoor unit on 60% of the bays (dress.ts:1217); none on the ${small} dressed small at L0 (they have them at L1 and lose them nearer); far level 1.05 m deep, solid plaster front, no glass or units (meshing.js:547-566)`,
+    { towardRoad: m ? bigFacing / m : NaN, towardRoadL1: m ? faces / m : NaN, flats: m, small }, !m ? "no data" : bigFacing / m >= 0.5 ? "present" : "partial", "share of the mid-rise flats");
+  row("bldg-shutters", "Ground-floor shutters on the mid-rise flats", `none in the code for flats: their ground floor is a door (dress.ts:1339-1343); shutters only on shop and office ground floors (20% of bays, dress.ts:1307-1309) and on 6% of a small building's units (dress.ts:724), so on the ${small} flats dressed small, as a bar's store room`,
+    { flats: m, small }, "none in the code", "count");
+  row("bldg-garage", "Garage doors on the mid-rise flats", "none in the code (no garage or car-port opening in scene/hero or tools/city/mesh; the one roll-up door is the shop shutter, materials.ts:124-125)", { flats: m }, "none in the code", "count");
+  row("bldg-lobby", "Lobbies / entrances of the mid-rise flats", "none in the code for flats: one timber door 0.85 x 2.0 m on each open wall (dress.ts:1341-1343; no glass entrance, canopy or letterboxes); a glass lobby only on office and shop towers of 45 m and 10 storeys (dress.ts:1067, 1287-1301)",
+    { flats: m }, "none in the code", "count");
+  const share = (s: Record<string, number> | null, k: string) => (s ? s[k] ?? 0 : NaN);
+  const mix = (k: string) => (m ? (small * share(code.smallWalls, k) + (m - small) * share(code.bigWalls, k)) / m : NaN);
+  const mapped = flats.filter((b) => b.mapped).length;
+  const kinds = ["tile", "render", "concrete", "metal panel", "sheet", "timber"];
+  row("bldg-facade", "Facade finish of the mid-rise flats (tile / concrete / metal panel)", `expected over the ${m}: ${kinds.map((k) => `${k} ${f(mix(k) * 100, 0)}%`).join(", ")} (near level: bigger buildings draw one of materials.ts:83-94 alike, small ones materials.ts:63-81 by weight); ${mapped} with a material mapped in OSM; far level: tile, brick or plaster, no concrete or metal (meshing.js:217-220)`,
+    { ...Object.fromEntries(kinds.map((k) => [k.replace(" panel", "Panel"), mix(k)])), mapped, flats: m }, !m || !code.bigWalls ? "no data" : mix("metal panel") > 0 ? "present" : "no metal panel", "share of the mid-rise flats");
+  return rows;
+}
+function insideRing(pts: [number, number][], x: number, z: number) {
+  let inside = false;
+  for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
+    const [xi, zi] = pts[i], [xj, zj] = pts[j];
+    if ((zi > z) !== (zj > z) && x < ((xj - xi) * (z - zi)) / (zj - zi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
 // ---------------------------------------------------------------- the audit
 export function audit(input: Input): Report {
-  const { tiles, edges, signals, rig, shapes, cell, bbox } = input;
+  const { tiles, edges, signals, rig, shapes, cell, bbox, code } = input;
   const rows: Row[] = [];
   const num = (v: number | null | undefined) => (v != null && Number.isFinite(v) ? v : null);
   const row = (id: string, item: string, standard: string, measured: string, value: number | null, verdict: string, source: string, values: Record<string, number | null | undefined>, unit: string) =>
@@ -465,7 +585,8 @@ export function audit(input: Input): Report {
       rig.poleHeight != null && rig.farPoleHeight != null && Math.abs(rig.poleHeight - rig.farPoleHeight) < 0.3 && rig.nearLamp != null && rig.farLamp != null && Math.abs(rig.nearLamp - rig.farLamp) < 0.3 ? "ok" : "near and far differ",
       "NTT East", { near: rig.poleHeight, far: rig.farPoleHeight, nearLamp: rig.nearLamp, farLamp: rig.farLamp }, "m");
   const furniture = streetFurniture(tiles, edges, bbox, footway);
-  return { rows, furniture, edgeLines, spacing, decals: decalCount };
+  const buildings = code ? streetBuildings(tiles, edges, bbox, code) : undefined;
+  return { rows, furniture, ...(buildings ? { buildings } : {}), edgeLines, spacing, decals: decalCount };
 }
 
 export function formatReport(r: Report, title: string): string {
@@ -480,18 +601,22 @@ export function formatReport(r: Report, title: string): string {
     out.push("", `The street furniture of ROADMAP 6h along minor roads (a prop counts for the nearest road centreline within ${BESIDE} m):`, "", "| Item | Standard (source) | Measured | Verdict |", "|---|---|---|---|");
     for (const x of r.furniture) out.push(`| ${x.item} | ${x.standard} | ${x.measured} | ${x.verdict} |`);
   }
+  if (r.buildings?.length) {
+    out.push("", `The buildings of ROADMAP 6h along minor roads (outline within ${FRONTING} m of the centreline; counts from the tiles, features from the dressing code):`, "", "| Item | Standard (source) | Measured | Verdict |", "|---|---|---|---|");
+    for (const x of r.buildings) out.push(`| ${x.item} | ${x.standard} | ${x.measured} | ${x.verdict} |`);
+  }
   return out.join("\n");
 }
 
 // ---------------------------------------------------------------- before / after
-/** A report as --json writes it (rows and furniture, or rows alone). */
-export type ReportJson = { rows: Row[]; furniture?: Row[] };
+/** A report as --json writes it (rows, furniture and buildings, or rows alone). */
+export type ReportJson = { rows: Row[]; furniture?: Row[]; buildings?: Row[] };
 const WITHIN = new Set(["ok", "present"]);
 const g = (v: number | null | undefined) => (v == null ? "-" : Number.isInteger(v) ? String(v) : String(Number(v.toPrecision(4))));
 /** The rows whose measured values (to four significant figures, as shown) or verdict changed between two reports, as a
  * Markdown table, and a count. "Within standard" is an "ok" or "present" verdict. */
 export function diffReports(before: ReportJson, after: ReportJson): string {
-  const all = (r: ReportJson) => [...r.rows, ...(r.furniture ?? [])];
+  const all = (r: ReportJson) => [...r.rows, ...(r.furniture ?? []), ...(r.buildings ?? [])];
   const was = new Map(all(before).map((r) => [r.id, r])), now = new Map(all(after).map((r) => [r.id, r]));
   const ids = [...now.keys(), ...[...was.keys()].filter((k) => !now.has(k))];
   const lines: string[] = [];
@@ -537,6 +662,7 @@ async function main() {
   const signals = (roads.signals ?? []).map((i): [number, number] => [roads.nodes[i][0], roads.nodes[i][2]]);
   const src = (p: string) => (existsSync(join(repoRoot, p)) ? readFileSync(join(repoRoot, p), "utf8") : "");
   const rig = parseRig(src("scene/hero/dress.ts"), src("scene/hero/streetprops.ts"));
+  const code = parseBuildingCode(src("scene/hero/dress.ts"), src("scene/hero/materials.ts"));
   let shapes: Input["shapes"] = null;
   try { shapes = await (await import("./decals.ts")).decalShapes(); } catch { shapes = null; }
   // the symbol's cell as the mesher lays it: one symbol, heading +z, on flat ground
@@ -546,7 +672,7 @@ async function main() {
     for (let i = 0; i < m.position.length; i += 3) { x0 = Math.min(x0, m.position[i]); x1 = Math.max(x1, m.position[i]); z0 = Math.min(z0, m.position[i + 2]); z1 = Math.max(z1, m.position[i + 2]); }
     return [x1 - x0, z1 - z0];
   };
-  const report = audit({ tiles, edges: roads.edges, signals, rig, shapes, cell, bbox });
+  const report = audit({ tiles, edges: roads.edges, signals, rig, shapes, cell, bbox, code });
   const data = JSON.stringify({ area, bbox, tiles: tiles.length, ...report }, null, 1);
   if (jsonFile) writeFileSync(jsonFile, data + "\n");
   if (j >= 0 && !jsonFile) console.log(data);
