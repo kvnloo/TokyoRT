@@ -195,6 +195,19 @@ function category(usage, height, seed) {
   return height < 9 ? CAT.HOUSE : seed < 0.5 ? CAT.APARTMENT : CAT.COMMERCIAL;
 }
 
+// A building's facade category. Without a look: the source's (glass for OSM's building:material=glass, for a tall
+// photoless LOD2 shell and for some offices by height). With one (ThreeRT: `b.look`, what the near levels' dressing
+// gave it), the look decides glass: a curtain wall is glass, any other building keeps its use's punched category, so
+// a building that is cream walls and windows near is not a curtain grid far away.
+export function facadeCategory(b, seed, glassTower = false) {
+  if (b.look) {
+    if (b.look.curtain) return CAT.GLASS;
+    const cat = category(b.usage, b.height, seed);
+    return cat === CAT.GLASS ? CAT.COMMERCIAL : cat;
+  }
+  return ((b.hint >>> 24) & 15) === MATERIAL.GLASS || glassTower ? CAT.GLASS : category(b.usage, b.height, seed);
+}
+
 // Tokyo wall finishes per category: [r, g, b, texture layer].
 const PALETTE = {
   [CAT.HOUSE]: [
@@ -318,7 +331,7 @@ export function buildingMesh(buildings, tx, tz, marks = []) {
     const shellTop = (list) => { let y = -Infinity; for (const f of list) for (let k = 1; k < f.rings[0].length; k += 3) y = Math.max(y, f.rings[0][k]); return y; };
     const glassTower = !!b.surfaces?.length && !b.surfaces.some((f) => f.uv) && Math.max(b.height, shellTop(b.surfaces) - b.base) > 90;
     // (ThreeRT: `b.look`, the colour and curtain wall the near levels' dressing gave it, when the caller has them)
-    const cat = b.look?.curtain || material === MATERIAL.GLASS || glassTower ? CAT.GLASS : category(b.usage, b.height, seed);
+    const cat = facadeCategory(b, seed, glassTower);
     const pal = PALETTE[cat], pick = pal[Math.floor(rnd() * pal.length)], tone = 0.92 + 0.16 * rnd();
     const wallCol = b.look ? b.look.wall : glassTower ? lin([0.3, 0.35, 0.41].map((c) => c * tone)) : painted ? lin(b.surfaces?.some((f) => f.uv) ? [((b.hint >> 16) & 255) / 255, ((b.hint >> 8) & 255) / 255, (b.hint & 255) / 255] : paint([((b.hint >> 16) & 255) / 255, ((b.hint >> 8) & 255) / 255, (b.hint & 255) / 255])) : lin(aerial(pick.slice(0, 3)).map((c) => Math.min(1, c * tone)));
     const wallLayer = HINT_LAYER[material] ?? pick[3];

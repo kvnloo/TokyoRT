@@ -10,6 +10,7 @@ import { Batches, Frame, add, mul, norm, rng, type KitPiece, type V3 } from "./b
 import type { StreetModel } from "./street.ts";
 import type { Mats } from "./materials.ts";
 import { shopCells } from "./shops.ts";
+import { dressGround } from "./ground.ts";
 import { aBoard, beerCases, bicycle, propMaterials, scooter, umbrellaStand, vendingMachine } from "./props.ts";
 
 export interface HeroData {
@@ -100,8 +101,8 @@ export function dressDistrict(data: HeroData, M: Mats, night: boolean, seed = 11
    *  their geometry (the renderer keeps one copy of each mesh). */
   type PropFn = (B: Batches, PM: ReturnType<typeof propMaterials>, at: V3, facing: V3, R: ReturnType<typeof rng>) => void;
   const protos = new Map<string, Mesh[]>();
-  const prop = (fn: PropFn, kind: string, variants: number, at: V3, facing: V3) => {
-    const v = R.int(variants), k = `${kind} ${v}`;
+  const prop = (fn: PropFn, kind: string, variants: number, at: V3, facing: V3, r = R) => {
+    const v = r.int(variants), k = `${kind} ${v}`;
     if (ab.record) {
       if (!ab.noProps) ab.record.push({ p: kind, v, at: [...at], ry: Math.atan2(facing[0], facing[2]) });
       count(kind);
@@ -170,6 +171,17 @@ export function dressDistrict(data: HeroData, M: Mats, night: boolean, seed = 11
     }
   }
   /** The top of the highest building at (x, z) but `skip` (-Infinity: none). */
+  // the cell's roads (the compiled carriageways and roads), for which way a building faces
+  const roadRings = data.areas.filter((a) => a.kind === 0 || a.kind === 1).map((a) => a.rings);
+  const inRing = (x: number, z: number, r: number[]) => {
+    let c = false;
+    for (let i = 0, n = r.length / 2, j = n - 1; i < n; j = i++) if ((r[i * 2 + 1] > z) !== (r[j * 2 + 1] > z) && x < ((r[j * 2] - r[i * 2]) * (z - r[i * 2 + 1])) / (r[j * 2 + 1] - r[i * 2 + 1]) + r[i * 2]) c = !c;
+    return c;
+  };
+  const onRoad = (x: number, z: number) => roadRings.some((rs) => inRing(x, z, rs[0]) && !rs.slice(1).some((h) => inRing(x, z, h)));
+  const walkRings = data.areas.filter((a) => a.kind === 2).map((a) => a.rings);
+  /** The ground's top here: a sidewalk's (20 cm up) where there is one, else just over the road. */
+  const surfaceY = (x: number, z: number) => terrain(x, z) + (walkRings.some((rs) => inRing(x, z, rs[0]) && !rs.slice(1).some((h) => inRing(x, z, h))) ? 0.2 : 0.075);
   const topAt = (x: number, z: number, skip?: Bldg) => {
     let t = -Infinity;
     for (const b of grid.get(key(Math.floor(x / CELL), Math.floor(z / CELL))) ?? []) {
@@ -185,7 +197,7 @@ export function dressDistrict(data: HeroData, M: Mats, night: boolean, seed = 11
 
   /** Exposed edges: walls that face an open alley (the space 1.2 m in front of them is no building's), or that rise
    *  well above the building in front of them: dressed from `from` (a height; -Infinity: from the ground) up. */
-  type Edge = { b: Bldg; f: Frame; L: number; y0: number; top: number; exposed: boolean; floors: number[]; small: boolean; from: number };
+  type Edge = { b: Bldg; f: Frame; L: number; y0: number; top: number; exposed: boolean; floors: number[]; small: boolean; from: number; seams?: number[]; blades?: [number, number, number][] };
   const edges: Edge[] = [];
 
   /** One window design per building (Tokyo about 1980: aluminium sashes in silver, bronze, white or black; tall, wide,
@@ -219,6 +231,20 @@ export function dressDistrict(data: HeroData, M: Mats, night: boolean, seed = 11
       curtain: hr ? { glass: hr.glass.name, spandrel: hr.spandrel.name, fin: hr.fin.name, spandrelH: hr.spandrelH } : null,
       windows: { layout: W.layout, w: +W.wFrac.toFixed(3), h: +W.hFrac.toFixed(3), frame: W.frame.name },
     });
+    // which side is the front: the wall that faces the most open ground (the street, not the gap to the next block)
+    const openAhead = b.pts.map(([ax, az], i) => {
+      const [cx, cz] = b.pts[(i + 1) % b.pts.length], l = Math.hypot(cx - ax, cz - az);
+      if (l < 1) return 0;
+      let nx = -(cz - az) / l, nz = (cx - ax) / l;
+      const mx = (ax + cx) / 2, mz = (az + cz) / 2;
+      if (inside(b.pts, mx + nx * 0.05, mz + nz * 0.05)) { nx = -nx; nz = -nz; }
+      let d = 0.5;
+      while (d < 20 && topAt(mx + nx * d, mz + nz * d, b) === -Infinity) d += 0.5;
+      // (a road in front makes it a front, whatever lies open elsewhere: a car park behind is no street)
+      const probe = Math.min(d, 6) - 0.5;
+      return d + (onRoad(mx + nx * probe, mz + nz * probe) ? 100 : 0);
+    });
+    const frontEdge = openAhead.indexOf(Math.max(...openAhead));
     for (let i = 0; i < b.pts.length; i++) {
       const [ax, az] = b.pts[i], [cx, cz] = b.pts[(i + 1) % b.pts.length];
       const L = Math.hypot(cx - ax, cz - az);
@@ -257,9 +283,11 @@ export function dressDistrict(data: HeroData, M: Mats, night: boolean, seed = 11
       edges.push(e);
       const openings: Opening[] = [];
       const hero = inBox(mx, mz);
-      if (exposed && hero && small) dressSmall(e, openings, wallMat);
+      if (exposed && hero && small) dressSmall(e, openings, wallMat, openAhead[i] >= openAhead[frontEdge] - 1);
       else if (exposed && L >= 2 && !ab.noMid) dressMid(e, openings, st, i === st.balconyEdge, i === st.longest);
       wall(e, openings, wallMat);
+      if (exposed && L >= 2 && !ab.noMid && !(hero && small) && !st.highrise) secondary(e, st, openings, i === st.longest);
+      if (exposed && hero && small) secondarySmall(e, openings);
     }
     // the roof: a slab inside the parapet, the coping on the walls round it, and what stands up there
     const ring = b.pts;
@@ -344,6 +372,224 @@ export function dressDistrict(data: HeroData, M: Mats, night: boolean, seed = 11
 
   /** A window: aluminium frame, sliding sashes, the glass, the room behind it; the opening into `openings`. One kit
    *  element (its frame, glass, sill and hood; the room behind is the cell's: its picture and light vary). */
+  /**
+   * What keeps a building's wall from reading as a box (roadmap 6b), at street level: its downpipes from the roof's edge
+   * to the ground, with brackets; the expansion joints of a long wall; kitchen and bathroom vent hoods beside the windows
+   * of flats and houses; the electric meter and its conduit at the ground floor (most street fronts); concrete hoods (庇)
+   * over some windows. Its own random stream (the wall's): the rest of the dressing draws what it drew before.
+   */
+  function secondary(e: Edge, st: Style, openings: Opening[], front: boolean) {
+    if (ab.full === false) return;
+    const { f, L, floors, top } = e, base = f.o[1];
+    const r = rng(hashSeed(e.b.id, 61, Math.round(L * 10)));
+    footBand(e, rng(hashSeed(e.b.id, 89, Math.round(L * 10))));
+    const Yf = (y: number) => y - base;
+    const free = (s0: number, s1: number, y0: number, y1: number, own?: Opening) => !openings.some((o) => o !== own && s1 > o.s0 - 0.08 && s0 < o.s1 + 0.08 && y1 > o.y0 - 0.05 && y0 < o.y1 + 0.05);
+    const ground = floors[0], gTop = floors[1] ?? top, roof = top - 0.15;
+    // downpipes: at one end (two on a long wall), the roof's edge to the ground, a bracket every 1.8 m, a swan neck at the top
+    const ends = L > 9 && r.chance(0.6) ? [0.18, L - 0.18] : [r.chance(0.5) ? 0.18 : L - 0.18];
+    for (const ps of ends) {
+      if (!free(ps - 0.06, ps + 0.06, gTop, roof)) continue;
+      // (down to the ground where the ground floor is wall; over a shop front it turns into the wall above it)
+      const foot = free(ps - 0.06, ps + 0.06, ground, gTop) ? ground + 0.12 : gTop + 0.15;
+      B.tube(M.pvc, [f.p(ps, Yf(roof), 0.11), f.p(ps, Yf(foot), 0.11)], 0.05, 8);
+      if (foot > ground + 1) B.tube(M.pvc, [f.p(ps, Yf(foot), 0.11), f.p(ps, Yf(foot), 0)], 0.05, 8);
+      B.tube(M.pvc, [f.p(ps, Yf(roof), 0.11), f.p(ps, Yf(roof) + 0.25, 0.32)], 0.05, 8);
+      for (let y = ground + 1.2; y < roof - 0.3; y += 1.8) B.box(M.steelDark, f, ps - 0.07, ps + 0.07, Yf(y), Yf(y) + 0.03, 0, 0.12);
+      count("downpipes");
+    }
+    // expansion joints: a long wall every 6-9 m, a sealant line top to bottom
+    if (L > 12) for (let s = r.range(6, 9); s < L - 3; s += r.range(6, 9)) {
+      if (!free(s - 0.02, s + 0.02, gTop, top)) continue;
+      B.box(M.cable, f, s - 0.012, s + 0.012, Yf(gTop), Yf(top - 0.1), 0, 0.006, { skip: "b" });
+      count("joints");
+    }
+    // vent hoods: beside some windows of flats and houses (a kitchen, a bathroom), a round cowl out of the wall
+    if (st.kind === "apartment" || st.kind === "house" || (st.kind === "commercial" && r.chance(0.4))) {
+      for (const o of openings) {
+        if (o.y0 < gTop || !r.chance(0.15)) continue;
+        const side = r.chance(0.5) ? -1 : 1, vs = side < 0 ? o.s0 - 0.3 : o.s1 + 0.3, vy = o.y1 - 0.15;
+        if (vs < 0.2 || vs > L - 0.2 || !free(vs - 0.12, vs + 0.12, vy - 0.12, vy + 0.12)) continue;
+        B.begin(f, vs, Yf(vy));
+        B.tube(M.steelDark, [f.p(vs, Yf(vy), 0), f.p(vs, Yf(vy), 0.12)], 0.075, 10);
+        B.box(M.steelDark, f, vs - 0.1, vs + 0.1, Yf(vy) - 0.1, Yf(vy) + 0.1, 0.12, 0.13);
+        B.end();
+        count("vents");
+      }
+    }
+    // the meter and its conduit up to the first floor, on the street front's ground floor
+    if (r.chance(front ? 0.7 : 0.3)) {
+      for (let t = 0; t < 8; t++) {
+        const ms = r.range(0.3, L - 0.3), my = ground + 1.6;
+        if (!free(ms - 0.2, ms + 0.2, my - 0.3, my + 0.3)) continue;
+        B.begin(f, ms, Yf(my));
+        B.box(M.paintMetal, f, ms - 0.17, ms + 0.17, Yf(my) - 0.24, Yf(my) + 0.24, 0, 0.12);
+        B.box(M.glass, f, ms - 0.09, ms + 0.09, Yf(my) - 0.05, Yf(my) + 0.12, 0.12, 0.125);
+        B.end();
+        if (free(ms - 0.05, ms + 0.05, my + 0.3, gTop)) B.tube(M.pvcDark, [f.p(ms, Yf(my) + 0.24, 0.04), f.p(ms, Yf(gTop) - 0.1, 0.04)], 0.018, 6);
+        count("meters");
+        break;
+      }
+    }
+    // concrete hoods over the windows of some walls
+    if (st.kind !== "office" && r.chance(0.25)) for (const o of openings) {
+      if (o.y0 < gTop || o.s1 - o.s0 > 3) continue;
+      if (!free(o.s0 - 0.12, o.s1 + 0.12, o.y1 + 0.02, o.y1 + 0.14, o)) continue;
+      B.box(M.coping, f, o.s0 - 0.12, o.s1 + 0.12, Yf(o.y1) + 0.03, Yf(o.y1) + 0.1, 0, 0.32, { skip: "b" });
+      count("hoods");
+    }
+  }
+
+  /** The ground along a wall's foot (6f): the dark damp band where splash, run-off and the lane's dirt collect, 0.25-0.5 m
+   *  out and ragged, a few millimetres over the road (hidden under a raised sidewalk where there is one). */
+  function footBand(e: Edge, r: { range(a: number, b: number): number }) {
+    const { f, L } = e;
+    const n = Math.max(1, Math.round(L / 0.8));
+    for (let k = 0; k < n; k++) {
+      const a = (k / n) * L, b = ((k + 1) / n) * L, wa = r.range(0.25, 0.5), wb = r.range(0.25, 0.5);
+      const g = (s: number, d: number): V3 => { const p = f.p(s, 0, d); return [p[0], surfaceY(p[0], p[2]) + 0.006, p[2]]; };
+      B.quad(M.footGrime, g(a, 0.02), g(b, 0.02), g(b, wb), g(a, wa), [0, 1, 0], [[0, 0], [1, 0], [1, 1], [0, 1]]);
+    }
+    count("foot bands");
+  }
+  /** A dark drip stain on the ground under an air conditioner (frame `s` along the wall, `d` out). */
+  function dripStain(e: Edge, s: number, d: number, r: { range(a: number, b: number): number }) {
+    const c = e.f.p(s, 0, d), rad = r.range(0.25, 0.45), y = surfaceY(c[0], c[2]) + 0.007;
+    const pts: V3[] = Array.from({ length: 8 }, (_, k) => { const a = (k / 8) * Math.PI * 2, q = rad * r.range(0.7, 1.15); return [c[0] + Math.cos(a) * q, y, c[2] + Math.sin(a) * q]; });
+    B.polygon(M.footGrime, pts, [0, 1, 2, 0, 2, 3, 0, 3, 4, 0, 4, 5, 0, 5, 6, 0, 6, 7], [0, 1, 0]);
+  }
+
+  /**
+   * The same for Golden Gai's small buildings (roadmap 6b), where the user's review looked: what they did not have yet
+   * (they have their drain, cables, gas pipe and meter, AC units, signs, awnings and door steps already). The sealant
+   * joint between two units from the ground up, and where a door's step meets the wall; a grey conduit up from a seam to the
+   * roof line; a louvred kitchen vent beside some doors and round bathroom vents by some upper windows; a trim surround
+   * on the upper windows of some buildings; small sheet-metal hoods over some. Its own random stream (the wall's).
+   */
+  function secondarySmall(e: Edge, openings: Opening[]) {
+    if (ab.full === false) return;
+    const { f, L, floors, top } = e, base = f.o[1];
+    const r = rng(hashSeed(e.b.id, 83, Math.round(L * 10)));
+    footBand(e, rng(hashSeed(e.b.id, 89, Math.round(L * 10))));
+    const Yf = (y: number) => y - base;
+    const ground = floors[0], gTop = floors[1] ?? top;
+    const near = (s0: number, s1: number, y0: number, y1: number, own?: Opening) => openings.some((o) => o !== own && s1 > o.s0 - 0.06 && s0 < o.s1 + 0.06 && y1 > o.y0 - 0.04 && y0 < o.y1 + 0.04);
+    const doors = openings.filter((o) => o.y0 <= ground + 0.15 && o.y1 - o.y0 < 2.4 && o.s1 - o.s0 < 1.3);
+    const windows = openings.filter((o) => o.y0 >= gTop - 0.1);
+    // the units' seams: a sealant joint up the wall where it is wall
+    for (const s of e.seams ?? []) {
+      if (near(s - 0.02, s + 0.02, ground, top)) continue;
+      B.box(M.cable, f, s - 0.008, s + 0.008, Yf(ground + 0.05), Yf(top - 0.1), 0, 0.004, { skip: "btdlr" });
+      count("seams");
+    }
+    // the door's step (dressSmall's) meets the wall in a sealant joint
+    for (const o of doors) {
+      B.box(M.cable, f, o.s0 - 0.08, o.s1 + 0.08, Yf(ground) + 0.08, Yf(ground) + 0.095, 0, 0.004, { skip: "btdlr" });
+      count("step joints");
+    }
+    // a conduit up a seam (or an end) to the roof line, clipped every metre
+    if (r.chance(0.8)) {
+      const cs = (e.seams ?? [])[0] ?? (r.chance(0.5) ? 0.25 : L - 0.25), at = cs + 0.08;
+      if (!near(at - 0.03, at + 0.03, ground + 1.2, top)) {
+        B.tube(M.pvc, [f.p(at, Yf(ground + 1.2), 0.04), f.p(at, Yf(top - 0.2), 0.04)], 0.016, 6);
+        for (let y = ground + 1.6; y < top - 0.4; y += 1) B.box(M.steelDark, f, at - 0.03, at + 0.03, Yf(y), Yf(y) + 0.02, 0, 0.06);
+        count("conduits");
+      }
+    }
+    // a bar's kitchen vent beside the door: a louvred box low on the wall
+    for (const o of doors) {
+      if (!r.chance(0.35)) continue;
+      const vs = r.chance(0.5) ? o.s0 - 0.35 : o.s1 + 0.35, vy = ground + 2.1;
+      if (vs < 0.2 || vs > L - 0.2 || near(vs - 0.15, vs + 0.15, vy - 0.15, vy + 0.15)) continue;
+      B.begin(f, vs, Yf(vy));
+      B.box(M.galv, f, vs - 0.15, vs + 0.15, Yf(vy) - 0.15, Yf(vy) + 0.15, 0, 0.1);
+      for (let q = 0; q < 4; q++) B.box(M.steelDark, f, vs - 0.13, vs + 0.13, Yf(vy) - 0.12 + q * 0.07, Yf(vy) - 0.1 + q * 0.07, 0.1, 0.13);
+      B.end();
+      count("vents");
+    }
+    // the massing (the user's review, a daytime photo of the lanes as reference): what stands out of the walls above
+    // the ground floor and makes the lane's outline. Projecting box signs at every storey, stacked up to the roof, both
+    // faces a bar's name (the bars upstairs: other shops' signs, `shopCells` of a hashed index, the stream untouched);
+    // air conditioners high on the walls on brackets, their pipes down the wall; cable bundles along the wall
+    const units = (e.seams?.length ?? 0) + 1, uw = L / units;
+    for (let k = 0; k < units; k++) {
+      const n = r.chance(0.5) ? 2 : r.chance(0.6) ? 1 : 3;
+      for (let q = 0; q < n; q++) {
+        const bs = k * uw + (r.chance(0.5) ? 0.15 : uw - 0.15), bw = r.range(0.65, 1.2), bh = r.range(0.42, 0.75);
+        const by0 = gTop + 0.25 + q * r.range(0.9, 1.3) + r.range(0, 0.3);
+        if (by0 + bh > top - 0.3 || bs < 0.1 || bs > L - 0.1) break;
+        if (near(bs - 0.05, bs + 0.05, by0 - 0.05, by0 + bh + 0.05)) continue;
+        // (clear of the unit's own blade sign: the shops' names stay readable)
+        if ((e.blades ?? []).some(([s, b0, b1]) => Math.abs(s - bs) < 0.5 && by0 < b1 + 0.15 && by0 + bh > b0 - 0.15)) continue;
+        const shop = shopCells(Math.floor(r.next() * 4096)), bf = new Frame(f.p(bs, 0, 0), mul(f.n, -1), f.u);
+        B.box(M.steelDark, bf, -0.14, 0, Yf(by0 + 0.08), Yf(by0 + 0.11), -0.015, 0.015);
+        B.box(M.steelDark, bf, -0.14, 0, Yf(by0 + bh - 0.11), Yf(by0 + bh - 0.08), -0.015, 0.015);
+        B.box(M.signFrame, bf, -0.12 - bw, -0.12, Yf(by0), Yf(by0 + bh), -0.08, 0.08, { front: M.shop(shop.page).box, frontUV: shop.lightbox, back: M.shop(shop.page).box, backUV: shop.lightbox });
+        count("box signs");
+      }
+    }
+    for (let a = 0; a < 1 + r.int(3); a++) {
+      const as = r.range(0.5, L - 0.5), ay = r.range(gTop + 0.4, Math.max(gTop + 0.5, top - 1.2));
+      if (near(as - 0.45, as + 0.45, ay - 0.1, ay + 0.65)) continue;
+      place("aircon", f.p(as, Yf(ay) + 0.32, 0.35), f.n, 0.82);
+      dripStain(e, as, 0.4, r);
+      for (const sx of [as - 0.33, as + 0.33]) B.box(M.steelDark, f, sx - 0.015, sx + 0.015, Yf(ay) - 0.02, Yf(ay) + 0.02, 0, 0.55);
+      B.tube(M.pvc, [f.p(as - 0.3, Yf(ay) + 0.25, 0.06), f.p(as - 0.3, Yf(ay) - 0.3, 0.06), f.p(as - 0.6, Yf(ay) - 0.6, 0.06), f.p(as - 0.6, Yf(ground + 0.3), 0.06)], 0.022, 6);
+      count("high aircons");
+    }
+    for (let c = 0; c < 1 + r.int(2); c++) {
+      const cy = gTop + r.range(0.3, 1.2), cd = r.range(0.04, 0.12), rr = r.range(0.012, 0.025), pts: V3[] = [];
+      const steps = Math.max(2, Math.round(L / 2.5));
+      for (let k = 0; k <= steps * 2; k++) pts.push(f.p((k / (steps * 2)) * L, Yf(cy) - (k % 2 ? r.range(0.04, 0.12) : 0), cd));
+      B.tube(c % 3 ? M.cable : M.cableGrey, pts, rr, 4);
+    }
+    count("cable bundles");
+    // the upper windows: a trim surround on some buildings, a small hood over some, a bathroom vent beside a few
+    const trim = r.chance(0.5), hooded = r.chance(0.4);
+    for (const o of windows) {
+      if (trim && !near(o.s0 - 0.09, o.s1 + 0.09, o.y0 - 0.09, o.y1 + 0.09, o)) {
+        B.box(M.coping, f, o.s0 - 0.09, o.s1 + 0.09, Yf(o.y1), Yf(o.y1) + 0.08, 0, 0.04, { skip: "blr" });
+        B.box(M.coping, f, o.s0 - 0.09, o.s0, Yf(o.y0) - 0.06, Yf(o.y1), 0, 0.04, { skip: "btd" });
+        B.box(M.coping, f, o.s1, o.s1 + 0.09, Yf(o.y0) - 0.06, Yf(o.y1), 0, 0.04, { skip: "btd" });
+        count("trims");
+      }
+      if (hooded && !near(o.s0 - 0.1, o.s1 + 0.1, o.y1 + 0.1, o.y1 + 0.22, o)) {
+        B.box(M.corrugatedEave, f, o.s0 - 0.1, o.s1 + 0.1, Yf(o.y1) + 0.12, Yf(o.y1) + 0.15, 0, 0.35, { skip: "blr" });
+        count("window hoods");
+      }
+      if (r.chance(0.2)) {
+        const vs = o.s1 + 0.3, vy = o.y1 - 0.1;
+        if (vs < L - 0.2 && !near(vs - 0.1, vs + 0.1, vy - 0.1, vy + 0.1)) {
+          B.begin(f, vs, Yf(vy));
+          B.tube(M.steelDark, [f.p(vs, Yf(vy), 0), f.p(vs, Yf(vy), 0.1)], 0.06, 10);
+          B.box(M.steelDark, f, vs - 0.08, vs + 0.08, Yf(vy) - 0.08, Yf(vy) + 0.08, 0.1, 0.11);
+          B.end();
+          count("vents");
+        }
+      }
+    }
+  }
+
+  /** The rain's streaks down the wall from a sill (frame height `y`, s0..s1 along): a decal 0.9 m long, not below 0.3 m
+   *  over the wall's foot (where the splash is). */
+  /** The rain's streaks down the wall from a sill (frame height `y`, s0..s1 along): runs of dirt a centimetre or two
+   *  wide, of their own lengths up to `len`, thinning to a point; not below 0.3 m over the wall's foot (the splash's).
+   *  Plain geometry 3 mm off the wall (an alpha-tested decal cost ~1 ms of GPU a frame in its any-hit tests), ~10
+   *  triangles a window, its pattern its own (`seed`). */
+  function streakUnder(f: Frame, s0: number, s1: number, y: number, seed: number, m = M.streak, len = 0.9, runs = 6) {
+    // (street level only: from the mid level's distance a streak is under a pixel)
+    if (ab.full === false) return;
+    const r = rng(hashSeed(seed, Math.round(len * 10)));
+    const w = s1 - s0 + 0.04, a0 = s0 - 0.02, d = 0.003;
+    for (let k = 0; k < runs; k++) {
+      const on = r.next() < 0.55, c = a0 + ((k + 0.25 + 0.5 * r.next()) / runs) * w, half = 0.004 + 0.006 * r.next();
+      const l = Math.min(y - 0.3, (0.2 + 0.8 * r.next()) * len);
+      if (!on || l < 0.1) continue;
+      const y1 = y - l * 0.7, y2 = y - l;
+      B.quad(m, f.p(c - half, y1, d), f.p(c + half, y1, d), f.p(c + half, y, d), f.p(c - half, y, d), f.n, [[0, 0.7], [1, 0.7], [1, 0], [0, 0]]);
+      B.tri(m, f.p(c - half, y1, d), f.p(c, y2, d), f.p(c + half, y1, d), f.n, [[0, 0.7], [0.5, 1], [1, 0.7]]);
+    }
+  }
   function windowAt(e: Edge, openings: Opening[], s0: number, s1: number, y0: number, y1: number, o: Parameters<typeof drawWindow>[6]) {
     // Drawn at a standard size, the nearest of a few (12 % apart), and stretched to its own: one kit piece per size and
     // kind of window. The bars stretch with it (by 6 % at most: a couple of millimetres).
@@ -357,8 +603,11 @@ export function dressDistrict(data: HeroData, M: Mats, night: boolean, seed = 11
       B.begin(e.f, s0, y0 - e.f.o[1], scale);
     });
     B.end();
+    // (the streaks in the cell's own meshes, each window its own: in a kit piece they made the wall's piece an instance
+    // too, 14 % more of them, or the opening's pieces five times as many)
+    if (!o.shop) streakUnder(e.f, s0, s1, y0 - e.f.o[1] - 0.05, Math.round(e.b.id * 7 + s0 * 13 + y0 * 3));
   }
-  function drawWindow(e: Edge, openings: Opening[] | null, s0: number, s1: number, y0: number, y1: number, o: { frosted?: boolean; lit?: number; grille?: boolean; inside?: number; frame?: typeof M.aluminium; depth?: number; bar?: boolean; shop?: boolean; hood?: boolean }, outside = () => {}) {
+  function drawWindow(e: Edge, openings: Opening[] | null, s0: number, s1: number, y0: number, y1: number, o: { frosted?: boolean; frostDraw?: boolean; lit?: number; grille?: boolean; inside?: number; frame?: typeof M.aluminium; depth?: number; bar?: boolean; shop?: boolean; hood?: boolean }, outside = () => {}) {
     const f = e.f, base = f.o[1], depth = snap(o.depth ?? W.depth, 0.02);
     openings?.push({ s0, s1, y0, y1, depth });
     const Y0 = y0 - base, Y1 = y1 - base, fr = o.frame ?? W.frame, t = 0.035, d = -depth;
@@ -400,15 +649,15 @@ export function dressDistrict(data: HeroData, M: Mats, night: boolean, seed = 11
       }
     }
     // the room behind
+    // (a shop's and a bar's inside: a room in depth behind the glass, its back wall interior.png's shelves and counter;
+    // the depth is the scene's interior mapping, TokyoMidGlow, on a plane just behind the glass)
     if (o.shop) {
-      // a shop's inside: a lit back wall well behind the glass
       const ci = o.inside ?? R.int(4);
-      B.rect(o.lit ? M.roomShop : M.roomDark, f, s0 - 0.3, Y0 - 0.1, s1 + 0.3, Y1 + 0.3, d - 2.2, [ci / 4 + 0.01, 0, (ci + 1) / 4 - 0.01, 1]);
-      B.flat(M.coping, f, s0, s1, d - 2.2, d, Y0 - 0.02);
-    } else if (o.bar && o.frosted) {
-      // a bar behind frosted glass: its inside, further back
-      const ci = R.int(4);
-      B.rect(o.lit ? M.roomBar : M.roomDark, f, s0 - 0.2, Y0 - 0.2, s1 + 0.2, Y1 + 0.2, d - 0.7, [ci / 4 + 0.01, 0.2, (ci + 1) / 4 - 0.01, 0.8]);
+      B.rect(M.roomShop, f, s0, Y0, s1, Y1, d - 0.25, [ci / 4 + 0.01, 0, (ci + 1) / 4 - 0.01, 1]);
+    } else if (o.bar) {
+      // (frosted or clear, a bar: its cell from the stream as the frosted ones drew it, else from the one it drew)
+      const ci = (o.frostDraw ?? o.frosted) ? R.int(4) : cellIx % 4;
+      B.rect(M.roomBar, f, s0, Y0, s1, Y1, d - 0.25, [ci / 4 + 0.01, 0, (ci + 1) / 4 - 0.01, 1]);
     } else {
       B.rect(roomFor(o.lit), f, s0, Y0, s1, Y1, d - 0.25, blindCell(cellIx));
     }
@@ -461,11 +710,12 @@ export function dressDistrict(data: HeroData, M: Mats, night: boolean, seed = 11
   }
 
   /** The dressing of a small building's open wall (Golden Gai's bars): its ground floor unit by unit, the floors above. */
-  function dressSmall(e: Edge, openings: Opening[], wallMat: typeof M.roof) {
+  function dressSmall(e: Edge, openings: Opening[], wallMat: typeof M.roof, front: boolean) {
     const { f, L, floors } = e;
     const base = f.o[1], y0 = floors[0], gTop = floors[1] ?? floors[floors.length - 1];
     const units = Math.max(1, Math.round(L / R.range(2.6, 3.6)));
     const uw = L / units;
+    e.seams = Array.from({ length: units - 1 }, (_, k) => (k + 1) * uw);
     for (let k = 0; k < units; k++) {
       const s0 = k * uw + 0.12, s1 = (k + 1) * uw - 0.12, w = s1 - s0;
       if (w < 0.9) continue;
@@ -534,7 +784,10 @@ export function dressDistrict(data: HeroData, M: Mats, night: boolean, seed = 11
       if (rest1 - rest0 > 0.7) {
         const ww = Math.min(rest1 - rest0, R.range(0.6, 1.5)), wc = (rest0 + rest1) / 2;
         const wy0 = y0 + R.range(0.9, 1.1), wy1 = wy0 + R.range(0.5, 0.85);
-        windowAt(e, openings, wc - ww / 2, wc + ww / 2, wy0, wy1, { frosted: R.chance(0.6), lit: lit(0.65, 1), grille: R.chance(0.45), bar: true });
+        // (frosted a quarter of the time; the roll's old threshold, 0.6, still says whether the window draws its picture
+        // from the stream, so the shops after it stay what they were)
+        const fr = R.next();
+        windowAt(e, openings, wc - ww / 2, wc + ww / 2, wy0, wy1, { frosted: fr < 0.25, frostDraw: fr < 0.6, lit: lit(0.65, 1), grille: R.chance(0.45), bar: true });
       }
       // posters and a meter
       if (rest1 - rest0 > 0.5 && R.chance(0.3)) {
@@ -564,6 +817,7 @@ export function dressDistrict(data: HeroData, M: Mats, night: boolean, seed = 11
         B.box(M.steelDark, bf, -0.18, 0, Y(by0 + 0.1), Y(by0 + 0.14), -0.02, 0.02);
         B.box(M.steelDark, bf, -0.18, 0, Y(by0 + bh - 0.14), Y(by0 + bh - 0.1), -0.02, 0.02);
         B.box(M.signFrame, bf, -0.16 - bh * 0.27, -0.16, Y(by0), Y(by0 + bh), -0.06, 0.06, { front: SM.blade, frontUV: shop.blade, back: SM.blade, backUV: shop.blade });
+        (e.blades ??= []).push([bs, by0, by0 + bh]);
         void c;
         count("blades");
       }
@@ -635,26 +889,51 @@ export function dressDistrict(data: HeroData, M: Mats, night: boolean, seed = 11
         return [at[0], gy, at[2]] as V3;
       };
       const free0 = left ? ds1 + 0.35 : s0 + 0.2, free1 = left ? s1 - 0.2 : ds0 - 0.35;
+      // what stands by a door is what happens there (roadmap 6c): on the street front, the shop's welcome (its board,
+      // potted plants by the door, the umbrella stand, a stool for the smokers); at a back door, the service (empty beer
+      // cases stacked to go back, the propane, the bins and bin bags, the mop and bucket, the kitchen's exhaust duct)
+      // (what the door's props drew from the stream before 6c, drawn still and dropped: the shops after them in the cell,
+      // their names and signs, stay what they were. The groups below draw from a stream of their own.)
       for (let pick = 0; pick < 2 && free1 - free0 > 0.35; pick++) {
         const roll = R.next();
-        const s = R.range(free0, free1);
-        // kept tidy: plants and a stool by the door, crates stacked square, a bin bag only now and then
-        if (roll < 0.14) {
-          const kind = R.pick(["crate1", "crate2", "crate3"] as const);
-          const h = kind === "crate3" ? 0.27 : 0.26, n = 1 + R.int(3);
-          for (let q = 0; q < n; q++) place(kind, add(clutter(s, 0.28), [0, q * h, 0]), f.n, 1, (R.next() - 0.5) * 0.06);
-        } else if (roll < 0.19) place("propane", clutter(s, 0.25), f.n, 1, R.next() * 6);
-        else if (roll < 0.22) {
-          place("trashbag", clutter(s, 0.3 + R.range(0, 0.2)), f.n, R.range(0.8, 1.0), R.next() * 6);
-        } else if (roll < 0.47) place(R.pick(["plant1", "plant2", "planter", "plant2"] as const), clutter(s, 0.3), f.n, R.range(0.8, 1.0), R.next() * 6);
-        else if (roll < 0.55) place("stool", clutter(s, 0.35), f.n, 1, R.next() * 6);
-        else if (roll < 0.58) place("box", clutter(s, 0.3), f.n, 1, R.next() * 6);
-        else if (roll < 0.62) place("planter", clutter(s, 0.3), f.n, 1, R.next() * 0.2);
-        else if (roll < 0.8) {
-          for (let q = 0; q < 2 + R.int(3); q++) place("plant4", clutter(s + q * 0.18, 0.15), f.n, R.range(1.2, 2.0), R.next() * 6);
-        } else if (roll < 0.86) prop((b, pm, a, fc, r) => beerCases(b, pm, a, fc, r, 3), "beercases", 6, clutter(s, 0.3), f.n);
-        else if (roll < 0.91) prop(umbrellaStand, "umbrellas", 4, clutter(s, 0.25), f.n);
-        else if (roll < 0.96) prop(aBoard, "aboard", 4, clutter(s, 0.45), f.n);
+        R.next();
+        if (roll < 0.14) { R.next(); const n = 1 + R.int(3); for (let q = 0; q < n; q++) R.next(); }
+        else if (roll < 0.19) R.next();
+        else if (roll < 0.22) { R.next(); R.next(); R.next(); }
+        else if (roll < 0.47) { R.next(); R.next(); R.next(); }
+        else if (roll < 0.62) R.next();
+        else if (roll < 0.8) { for (let q = 0; q < 2 + R.int(3); q++) { R.next(); R.next(); } }
+        else if (roll < 0.96) R.next();
+      }
+      const G = rng(hashSeed(seed, e.b.id, k, 67, Math.round(s0 * 10)));
+      const room = free1 - free0;
+      const nextTo = (q: number) => (left ? free0 + q : free1 - q);
+      if (front) {
+        if (room > 0.5 && G.chance(0.45)) prop(aBoard, "aboard", 4, clutter(nextTo(0.25), 0.5), f.n, G);
+        // plants in pots on both sides of the door
+        for (const side of [left ? ds0 - 0.2 : ds1 + 0.2, nextTo(0.15)]) {
+          if (!G.chance(0.55) || side < s0 + 0.1 || side > s1 - 0.1) continue;
+          if (G.chance(0.4)) for (let q = 0; q < 2 + G.int(2); q++) place("plant4", clutter(side + (q - 1) * 0.16, 0.15), f.n, G.range(1.2, 2.0), G.next() * 6);
+          else place(G.pick(["plant1", "plant2", "planter"] as const), clutter(side, 0.3), f.n, G.range(0.8, 1.0), G.next() * 6);
+        }
+        if (room > 0.9 && G.chance(0.3)) prop(umbrellaStand, "umbrellas", 4, clutter(nextTo(0.7), 0.25), f.n, G);
+        if (room > 1.2 && G.chance(0.2)) place("stool", clutter(nextTo(1.0), 0.4), f.n, 1, G.next() * 6);
+      } else {
+        let q = 0.25;
+        if (room > q + 0.3 && G.chance(0.65)) { prop((b, pm, a, fc, r) => beerCases(b, pm, a, fc, r, 2 + G.int(4)), "beercases", 6, clutter(nextTo(q), 0.3), f.n, G); q += 0.5; }
+        if (room > q + 0.3 && G.chance(0.35)) { place("propane", clutter(nextTo(q), 0.25), f.n, 1, G.next() * 6); q += 0.35; }
+        if (room > q + 0.3 && G.chance(0.5)) { place("can", clutter(nextTo(q), 0.3), f.n, 1, G.next() * 6); q += 0.35; }
+        for (let k = 0; k < G.int(3) && room > q + 0.3; k++) { place("trashbag", clutter(nextTo(q), 0.3 + G.range(0, 0.15)), f.n, G.range(0.8, 1.0), G.next() * 6); q += 0.3; }
+        if (room > q + 0.3 && G.chance(0.35)) { place("mopbucket", clutter(nextTo(q), 0.22), f.n, 1, (G.next() - 0.5) * 0.4); q += 0.35; }
+        // the kitchen's exhaust: a galvanised duct out of the wall over the door, up to the eave, a cowl at its top
+        if (G.chance(0.4)) {
+          const xs = left ? ds1 + 0.3 : ds0 - 0.3, dy0 = y0 + dh + 0.35, dy1 = Math.max(dy0 + 1, gTop + 1.2);
+          if (xs > s0 + 0.2 && xs < s1 - 0.2) {
+            B.box(M.galv, f, xs - 0.13, xs + 0.13, Y(dy0), Y(dy1), 0.02, 0.28, { skip: "b" });
+            B.box(M.galv, f, xs - 0.2, xs + 0.2, Y(dy1), Y(dy1) + 0.06, 0, 0.36);
+            count("ducts");
+          }
+        }
       }
       // a neon emblem on the wall now and then
       if (R.chance(0.12) && w > 1.6) neonShape(f, left ? s1 - 0.45 : s0 + 0.45, Y(y0 + dh + 0.4), 0.45, 0.05, R.pick(M.neon));
@@ -987,7 +1266,11 @@ export function dressDistrict(data: HeroData, M: Mats, night: boolean, seed = 11
         if (st.kind === "commercial" && R.chance(W.neon * 0.25) && fh - (wy1 - fy) > 0.5) neonShape(f, wc, Y(wy1) + Math.min(0.45, (fy + fh - wy1) / 2), 0.5, 0.06, R.pick(M.neon));
         // signs in the windows of the mixed-use floors (a bar, a karaoke room, a clinic)
         else if (st.kind === "commercial" && R.chance(0.3) && wy1 - wy0 > 0.8) lightboxAt(f, wc - ww / 2 + 0.05, wc + ww / 2 - 0.05, Y(wy1) + 0.05, Y(wy1) + Math.min(0.45, fy + fh - wy1 - 0.05), 0.08);
-        if (st.kind !== "office" && R.chance(0.15)) place(R.chance(0.5) ? "aircon" : "aircon", f.p(wc + ww / 2 + 0.6, Y(wy0) + 0.1, 0.25), f.n, 0.82);
+        if (st.kind !== "office" && R.chance(0.15)) {
+          place(R.chance(0.5) ? "aircon" : "aircon", f.p(wc + ww / 2 + 0.6, Y(wy0) + 0.1, 0.25), f.n, 0.82);
+          // (its condensate drips down the wall under it)
+          streakUnder(f, wc + ww / 2 + 0.45, wc + ww / 2 + 0.75, Y(wy0) + 0.05, e.b.id * 5 + k, M.drip, 1.4, 3);
+        }
       }
     }
     // articulation: floor bands, piers between the bays, a crown at the top (a second finish)
@@ -1191,6 +1474,15 @@ export function dressDistrict(data: HeroData, M: Mats, night: boolean, seed = 11
     place("manhole", [x, groundY(x, z) + 0.005, z], [0, 0, 1], 1, R.next() * 6);
     k++;
   }
+  }
+  // a baked cell's streets at street level: manholes, repairs and their seams, the kerbs' gutter lines (hero/ground.ts)
+  if (ab.cell && ab.full) {
+    R = rng(hashSeed(seed, -3, ...ab.cell));
+    const g = dressGround({ areas: data.areas, box: ab.cell, terrain, B, R, M: { patch: M.roadPatch, seam: M.roadSeam, gutterWet: M.gutterWet, gutterDust: M.gutterDust, lane: M.laneWorn, stain: M.laneStains }, place });
+    counts.manholes = (counts.manholes ?? 0) + g.manholes;
+    counts["road repairs"] = (counts["road repairs"] ?? 0) + g.patches + g.trenches;
+    counts.kerbs = (counts.kerbs ?? 0) + g.kerbs;
+    counts.lanes = (counts.lanes ?? 0) + g.lanes;
   }
 
   // Trees share their seed, placement and silhouette across the three city levels.

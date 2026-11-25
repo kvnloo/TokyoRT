@@ -44,6 +44,18 @@ function heroTex(file: string) {
 
 export type Mats = ReturnType<typeof heroMaterials>;
 
+/** A ground finish mapped in world space (`size` m a repeat): a decal on the road needs no UVs of its own and lines up
+ *  with nothing. Wet by night as the road is. */
+function groundFinish(id: string, size: number, tint: [number, number, number], name: string, rough = 1) {
+  const map = finishMap(id, "color");
+  map.repeat = [1 / size, 1 / size];
+  return new SurfaceMaterial({ name, map, normalMap: finishMap(id, "normal"), roughnessMap: finishMap(id, "rough"), worldScale: size, color: tint, roughness: rough, wet: 1 });
+}
+/** The streaks' dirt (hero/dress.ts `streakUnder`): grey-brown, matte; the AC drip's a little darker. */
+function streakMaterial(name: string, color: [number, number, number]) {
+  return new MeshStandardMaterial({ name, color, roughness: 0.95 });
+}
+
 export function heroMaterials(night: boolean) {
   // walls: Tokyo about 1980, kept up. Small buildings: painted mortar and stucco in pale colours, cream and brown
   // tile, clean timber and sheet metal. Weathered by cause (`WEATHER`): damp at the foot, bleached toward the south;
@@ -121,6 +133,8 @@ export function heroMaterials(night: boolean) {
   /** Window frames: silver and bronze aluminium, white and black painted. */
   const frames = [aluminium, aluminiumDark, frameWhite, frameBlack];
   const steelDark = new MeshStandardMaterial({ name: "steel dark", color: 0x1f2124, roughness: 0.55, metalness: 0.8 });
+  /** Galvanised sheet (a kitchen's exhaust duct): dull, spangled grey. */
+  const galv = new MeshStandardMaterial({ name: "galvanised duct", color: 0x8f938e, roughness: 0.6, metalness: 0.7 });
   const paintMetal = new MeshStandardMaterial({ name: "painted metal grey", color: 0x6f716e, roughness: 0.5, metalness: 0 });
   const pvc = new MeshStandardMaterial({ name: "pvc pipe", color: 0x9a9b96, roughness: 0.45 });
   const pvcDark = new MeshStandardMaterial({ name: "pvc dark", color: 0x3a3a38, roughness: 0.5 });
@@ -199,8 +213,17 @@ export function heroMaterials(night: boolean) {
   };
   return {
     shop, roofs, roofsSmall,
+    roadPatch: groundFinish("asphalt", 3.5, [0.15, 0.15, 0.16], "road repair", 0.9),
+    footGrime: groundFinish("asphalt", 3.5, [0.2, 0.18, 0.16], "wall foot grime", 0.6),
+    laneWorn: groundFinish("asphalt-fresh", 3, [1.0, 0.98, 0.95], "lane worn asphalt"),
+    // (a stain on a lane, rim to heart: the lane's own surface, darker in three steps)
+    laneStains: [[0.78, 0.76, 0.73], [0.55, 0.52, 0.48], [0.34, 0.31, 0.28]].map((t, i) => groundFinish("asphalt-fresh", 3, t as [number, number, number], `lane stain ${i}`)),
+    roadSeam: new MeshStandardMaterial({ name: "road seam", color: [0.02, 0.02, 0.022], roughness: 0.75 }),
+    gutterWet: groundFinish("asphalt", 3.5, [0.42, 0.41, 0.4], "kerb gutter line", 0.55),
+    gutterDust: groundFinish("concrete-worn", 2.5, [0.92, 0.87, 0.78], "kerb grit"),
+    streak: streakMaterial("streak sill", [0.2, 0.185, 0.165]), drip: streakMaterial("streak drip", [0.13, 0.12, 0.11]),
     walls, wallWeights, bigWalls, plinth, coping, roof, ground, groundB, gutter, grate, doorWood, shutter, shutterPainted, corrugatedEave, rustyMetal,
-    aluminium, aluminiumDark, steelDark, paintMetal, pvc, pvcDark, cable, cableGrey, concretePole, insulator, transformer,
+    aluminium, aluminiumDark, steelDark, galv, paintMetal, pvc, pvcDark, cable, cableGrey, concretePole, insulator, transformer,
     glass, frosted, curtainGlass, spandrels, helipadPaint, helipadWhite, aviation, roomLit, roomDim, roomDark, rooms, neon, trims, frames, frameWhite, frameBlack, roomBar, roomShop, roomOffice, tank, laundry, notices, gasPipe, signBox, signBlade, lanternPaper, norenCloth, poster, signFrame, bulb, globe, vending, vendingBody,
   };
 }
