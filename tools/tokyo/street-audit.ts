@@ -267,7 +267,7 @@ export function streetFurniture(tiles: Tile[], edges: Edge[], bbox: Box | null |
   row("vending", "Vending machines beside minor roads", `${f(perKm(vending.length), 1)} per km (${vending.length})`, { perKm: perKm(vending.length), count: vending.length }, present(vending.length));
   const parked = beside(PROP.PARKED), onStreet = parked.filter((p) => carriageway.has(p.x, p.z)).length, allCars = all.filter((p) => p.kind === PROP.PARKED).length;
   row("parked-cars", "Parked cars on minor roads", `${f(perKm(onStreet), 1)} per km on the carriageway (${onStreet}); ${parked.length - onStreet} in car parks beside them; ${allCars} cars in all, all of them placed in mapped car parks`,
-    { perKm: perKm(onStreet), onStreet, beside: parked.length - onStreet, total: allCars }, onStreet ? "present" : "none in the data");
+    { perKm: perKm(onStreet), onStreet, beside: parked.length - onStreet, total: allCars }, perKm(onStreet) >= 0.1 ? "present" : "none in the data"); // (a stray car-park car on a road piece is not street parking)
   const info = beside(PROP.INFO).length;
   row("sign-posts", "Sign posts (road signs) beside minor roads", `none in the data (no prop kind for a road sign; ${info} map boards, PROP.INFO)`, { perKm: 0, mapBoards: info }, "none in the data");
   const poles = beside(PROP.POLE), cans = poles.filter((p) => p.variant & 1).length;
