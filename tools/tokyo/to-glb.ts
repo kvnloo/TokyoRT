@@ -283,9 +283,11 @@ if (looks) {
   }
 } else if (cityLevel) console.warn(`(no ${looksFile}: the far level in the source's colours; run tools/tokyo/city-bake.ts first)`);
 const albedo = (name: string) => (looks!.materials[name]?.albedo ?? [0.5, 0.5, 0.5]).map((v) => Math.min(0.9, v));
-/** A tower's vision glass far away: the dress's curtain glass (tinted, the rooms behind it) as an opaque pane of its
- *  colour at the brightness it reads by day. */
-const CURTAIN_FAR = 0.35;
+/** A tower's vision glass far away: the dress's curtain glass as an opaque pane of its colour, nearly black. Clear glass
+ *  scatters next to no light itself: what it shows is its reflection and the tinted room behind it (the scene's
+ *  `TokyoFarCurtainRoom`). At 0.35 a sunlit bronze tower read as a pale wall far away and dark glass at L1 (the towers
+ *  pose's 480 m switch, swept: 0.35 / 0.12 / 0.06 / 0.02 gave mean ΔE 0.40 / 0.27 / 0.24 / 0.21). */
+const CURTAIN_FAR = 0.02;
 /** The curtain glass the far level uses, and what it lets through (its linear colour: the dress's glass transmits it
  *  all, tinted): the scene's rooms behind a far tower's panes by day are that much dimmer, as they are near. */
 const curtains: Record<string, number[]> = {};
