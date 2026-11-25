@@ -10,9 +10,14 @@
 //     source: conductor heights, sag, pole and lamp heights. If the rig's code changes shape, those rows say so.
 // The standards are cited by name: 道路標識、区画線及び道路標示に関する命令 (標識令), 警察庁「交通規制基準」 (規制基準),
 // 安全で快適な自転車利用環境創出ガイドライン (自転車GL), 有線電気通信設備令施行規則 第7条.
-//   node tools/tokyo/street-audit.ts [--area=shinjuku] [--bbox=minX,minZ,maxX,maxZ] [--tiles=<dir>] [--json]
-// (bbox in the area's own frame, metres east and south of its origin). Always exits 0: it is a report.
-import { readFileSync, readdirSync, existsSync, realpathSync } from "node:fs";
+//   node tools/tokyo/street-audit.ts [--area=shinjuku] [--bbox=minX,minZ,maxX,maxZ] [--tiles=<dir>] [--json [<file>]]
+//   node tools/tokyo/street-audit.ts --diff before.json after.json
+// (bbox in the area's own frame, metres east and south of its origin). `--json <file>` writes every row as data
+// (id, item, standard, source, measured numbers, unit, verdict) beside the Markdown; `--diff` lists the rows whose
+// numbers or verdict changed between two such files: the before / after of a change to the street. Always exits 0.
+// Below the standards' rows, the street furniture of 6h along minor roads: what the tiles hold per km, and what they
+// do not hold at all ("none in the data").
+import { readFileSync, readdirSync, existsSync, realpathSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { repoRoot } from "../lib/paths.ts";
 import { AREA, PROP, DECAL, decodeTile } from "../city/shared/tileformat.js";
@@ -32,8 +37,11 @@ export type Input = {
   cell: (variant: number) => [number, number];
   bbox?: Box | null;
 };
-export type Row = { id: string; item: string; standard: string; measured: string; value: number | null; verdict: string };
-export type Report = { rows: Row[]; edgeLines: { cls: string; width: string; km: number; anySide: number; bothSides: number }[]; spacing: { bin: string; n: number }[]; decals: Record<string, number> };
+/** A row of the report. `standard` and `measured` are the Markdown's text; `source` names the document the standard comes
+ * from; `values` are the measured numbers (null where there was nothing to measure), `unit` the unit of the lengths among
+ * them (counts, shares and per-km figures say so in their names). */
+export type Row = { id: string; item: string; standard: string; source: string; measured: string; value: number | null; values: Record<string, number | null>; unit: string; verdict: string };
+export type Report = { rows: Row[]; furniture: Row[]; edgeLines: { cls: string; width: string; km: number; anySide: number; bothSides: number }[]; spacing: { bin: string; n: number }[]; decals: Record<string, number> };
 
 const CELL_W = 256, CELL_H = 512; // the atlas cell in texels (tools/tokyo/decals.ts)
 const MINOR = new Set(["residential", "unclassified", "living_street"]);
@@ -206,11 +214,82 @@ export function parseRig(dress: string, streetprops: string): Rig {
   };
 }
 
+function areaIndex(tiles: Tile[], kinds: number[]) {
+  const idx = new PolyIndex(24);
+  for (const t of tiles) for (const a of t.areas) if (kinds.includes(a.kind)) for (const rings of a.polygons) {
+    idx.add(rings.map((r) => { const pts: [number, number][] = []; for (let i = 0; i + 1 < r.length; i += 2) pts.push([r[i], r[i + 1]]); return pts; }));
+  }
+  return idx;
+}
+
+// ---------------------------------------------------------------- the street furniture of 6h, along minor roads
+const BESIDE = 8; // a prop belongs to the road whose centreline is nearest, within this many metres
+const STEP = 2; // the centrelines sampled every STEP metres
+const NO_STANDARD = "no standard (6h: the photograph)";
+/** What stands along the minor roads, per km of road: what the tiles hold (tools/city/pipeline/landscape.mjs and
+ * extras.mjs place it), and what they do not. A prop counts for the road whose centreline sample is nearest within
+ * BESIDE metres, if that road is minor; trees inside parks and woods are left out. */
+export function streetFurniture(tiles: Tile[], edges: Edge[], bbox: Box | null | undefined, footway: { n: number; kerb: number; line: number; neither: number }): Row[] {
+  const samples: { x: number; z: number; minor: boolean }[] = [];
+  for (const e of edges) {
+    const minor = MINOR.has(e.highway) && !e.bridge && !e.tunnel;
+    const pts: [number, number][] = [];
+    for (let i = 0; i + 2 < e.pts.length; i += 3) pts.push([e.pts[i], e.pts[i + 2]]);
+    forEachAlong(pts, STEP, (x: number, z: number) => { samples.push({ x, z, minor }); });
+  }
+  const km = samples.filter((p) => p.minor && inBox(bbox, p.x, p.z)).length * STEP / 1000;
+  const grid = new Grid(16, samples);
+  const besideMinor = (x: number, z: number) => {
+    let best = Infinity, minor = false;
+    for (const p of grid.near(x, z, BESIDE)) { const d = Math.hypot(p.x - x, p.z - z); if (d < best) { best = d; minor = p.minor; } }
+    return minor;
+  };
+  const parks = areaIndex(tiles, [AREA.PARK, AREA.WOOD]), carriageway = areaIndex(tiles, [AREA.CARRIAGEWAY]);
+  const all = tiles.flatMap((t) => t.props.filter((p) => inBox(bbox, p.x, p.z)));
+  const beside = (kind: number, keep: (p: Tile["props"][number]) => boolean = () => true) => all.filter((p) => p.kind === kind && keep(p) && besideMinor(p.x, p.z));
+  const perKm = (n: number) => (km > 0 ? n / km : NaN);
+  const rows: Row[] = [];
+  const row = (id: string, item: string, measured: string, values: Record<string, number>, verdict: string, unit = "per km") => {
+    const v = Object.values(values)[0];
+    rows.push({ id, item, standard: NO_STANDARD, source: "-", measured, value: Number.isFinite(v) ? v : null,
+      values: Object.fromEntries(Object.entries(values).map(([k, x]) => [k, Number.isFinite(x) ? x : null])), unit, verdict });
+  };
+  const present = (n: number) => (n ? "present" : "none in the data");
+
+  const trees = beside(PROP.TREE, (p) => !parks.has(p.x, p.z));
+  row("street-trees", "Street trees beside minor roads", `${f(perKm(trees.length), 1)} per km (${trees.length} on ${f(km, 1)} km)`, { perKm: perKm(trees.length), count: trees.length, km }, present(trees.length));
+  const vending = beside(PROP.VENDING);
+  row("vending", "Vending machines beside minor roads", `${f(perKm(vending.length), 1)} per km (${vending.length})`, { perKm: perKm(vending.length), count: vending.length }, present(vending.length));
+  const parked = beside(PROP.PARKED), onStreet = parked.filter((p) => carriageway.has(p.x, p.z)).length, allCars = all.filter((p) => p.kind === PROP.PARKED).length;
+  row("parked-cars", "Parked cars on minor roads", `${f(perKm(onStreet), 1)} per km on the carriageway (${onStreet}); ${parked.length - onStreet} in car parks beside them; ${allCars} cars in all, all of them placed in mapped car parks`,
+    { perKm: perKm(onStreet), onStreet, beside: parked.length - onStreet, total: allCars }, onStreet ? "present" : "none in the data");
+  const info = beside(PROP.INFO).length;
+  row("sign-posts", "Sign posts (road signs) beside minor roads", `none in the data (no prop kind for a road sign; ${info} map boards, PROP.INFO)`, { perKm: 0, mapBoards: info }, "none in the data");
+  const poles = beside(PROP.POLE), cans = poles.filter((p) => p.variant & 1).length;
+  const spans: number[][] = [];
+  for (const t of tiles) for (let i = 0; i + 3 < t.wires.length; i += 4) {
+    const mx = (t.wires[i] + t.wires[i + 2]) / 2, mz = (t.wires[i + 1] + t.wires[i + 3]) / 2;
+    if (inBox(bbox, mx, mz) && besideMinor(mx, mz)) spans.push([mx, mz]);
+  }
+  row("transformers", "Transformers / boxes on poles, minor roads", `${f(perKm(cans), 1)} transformers per km, the far pole model's (${cans} of ${poles.length} poles, ${f(poles.length ? cans / poles.length * 100 : NaN, 0)}%; ${f(spans.length ? cans / spans.length : NaN, 2)} per span); no pole-mounted boxes (no prop kind or variant)`,
+    { perKm: perKm(cans), count: cans, poles: poles.length, perPole: poles.length ? cans / poles.length : NaN, perSpan: spans.length ? cans / spans.length : NaN, boxes: 0 }, present(cans));
+  const lights = beside(PROP.LIGHT).length;
+  row("lamp-arms", "Lamp arms, minor roads", `${f(perKm(poles.length), 1)} per km: one on each utility pole (${poles.length}; ${f(spans.length ? poles.length / spans.length : NaN, 2)} per span), plus ${lights} standalone street or path lights`,
+    { perKm: perKm(poles.length), poleLamps: poles.length, perSpan: spans.length ? poles.length / spans.length : NaN, lights, lightsPerKm: perKm(lights) }, present(poles.length + lights));
+  const share = (n: number) => (footway.n ? n / footway.n : NaN);
+  row("footway", "Footway edge on minor roads: kerb or white line", `kerbed footway ${f(share(footway.kerb) * 100, 1)}%, white line and no kerb ${f(share(footway.line) * 100, 1)}%, neither ${f(share(footway.neither) * 100, 1)}% (${footway.n} road sides, every 10 m)`,
+    { kerb: share(footway.kerb), line: share(footway.line), neither: share(footway.neither), sides: footway.n },
+    !footway.n ? "no data" : footway.kerb >= footway.line && footway.kerb >= footway.neither ? "mostly kerbed" : footway.line >= footway.neither ? "mostly white line" : "mostly neither", "share of road sides");
+  return rows;
+}
+
 // ---------------------------------------------------------------- the audit
 export function audit(input: Input): Report {
   const { tiles, edges, signals, rig, shapes, cell, bbox } = input;
   const rows: Row[] = [];
-  const row = (id: string, item: string, standard: string, measured: string, value: number | null, verdict: string) => rows.push({ id, item, standard, measured, value, verdict });
+  const num = (v: number | null | undefined) => (v != null && Number.isFinite(v) ? v : null);
+  const row = (id: string, item: string, standard: string, measured: string, value: number | null, verdict: string, source: string, values: Record<string, number | null | undefined>, unit: string) =>
+    rows.push({ id, item, standard, source, measured, value, values: Object.fromEntries(Object.entries(values).map(([k, v]) => [k, num(v)])), unit, verdict });
   const within = (v: number, lo: number, hi: number, tol = 0.005) => (!Number.isFinite(v) ? "no data" : v < lo - tol ? "under" : v > hi + tol ? "over" : "ok");
 
   // paint
@@ -243,7 +322,8 @@ export function audit(input: Input): Report {
   const unsignalled = crossings.filter((c) => !sigGrid.near(c.x, c.z, 30).length).length;
 
   const lw = median(lines.map((q) => q.wid));
-  row("lane-width", "Lane line width (102)", "0.10-0.15 m (標識令 別表第四; 規制基準 p.94 市街地)", `${f(lw)} m median of ${lines.length} line pieces`, lw, within(lw, 0.1, 0.15));
+  row("lane-width", "Lane line width (102)", "0.10-0.15 m (標識令 別表第四; 規制基準 p.94 市街地)", `${f(lw)} m median of ${lines.length} line pieces`, lw, within(lw, 0.1, 0.15),
+    "標識令 別表第四; 規制基準 p.94", { median: lw, pieces: lines.length }, "m");
   const runs = chains(lines), dashes = runs.filter((r) => r.len <= 8);
   const dashGrid = new Grid(8, dashes.flatMap((r) => r.free.map((p) => ({ ...p, r }))));
   const gaps: number[] = [];
@@ -258,16 +338,20 @@ export function audit(input: Input): Report {
   }
   const dl = median(dashes.map((r) => r.len)), dg = median(gaps);
   row("dash", "Lane line dash / gap", "6 m line, 9 m gap urban (規制基準 p.94); 標識令 allows l1 3-10 m, l2 (1-2) l1", `${f(dl, 1)} m / ${f(dg, 1)} m (median of ${dashes.length} dashes)`, dl,
-    !Number.isFinite(dl) ? "no data" : Math.abs(dl - 6) < 0.5 && Math.abs(dg - 9) < 0.5 ? "ok" : dl >= 3 && dl <= 10 && dg >= dl * 0.95 && dg <= dl * 2.05 ? "within 標識令, not the urban standard" : "outside 標識令");
+    !Number.isFinite(dl) ? "no data" : Math.abs(dl - 6) < 0.5 && Math.abs(dg - 9) < 0.5 ? "ok" : dl >= 3 && dl <= 10 && dg >= dl * 0.95 && dg <= dl * 2.05 ? "within 標識令, not the urban standard" : "outside 標識令",
+    "規制基準 p.94; 標識令", { dash: dl, gap: dg, dashes: dashes.length }, "m");
 
   // stop lines, with 止まれ's (within 8 m of a STOP symbol) apart
   const decals = tiles.flatMap((t) => t.props.filter((p) => p.kind === PROP.DECAL && inBox(bbox, p.x, p.z)));
   const stopText = new Grid(8, decals.filter((p) => p.variant === DECAL.STOP));
   const sw = median(stopLines.map((q) => q.wid)), swStop = median(stopLines.filter((q) => stopText.near(q.x, q.z, 8).length).map((q) => q.wid));
-  row("stop-line", "Stop line width (203)", "0.30-0.45 m (標識令 別表第六)", `${f(sw)} m median of ${stopLines.length}; at 止まれ ${f(swStop)} m`, sw, within(sw, 0.3, 0.45));
+  row("stop-line", "Stop line width (203)", "0.30-0.45 m (標識令 別表第六)", `${f(sw)} m median of ${stopLines.length}; at 止まれ ${f(swStop)} m`, sw, within(sw, 0.3, 0.45),
+    "標識令 別表第六", { median: sw, atStop: swStop, lines: stopLines.length }, "m");
   const zw = median(zebra.map((q) => q.wid)), zg = median(zebra.map((q) => pitchOf.get(q)! - q.wid)), zl = median(zebra.map((q) => q.len));
-  row("zebra-bars", "Zebra bar width / gap (201)", "bar 0.45-0.50 m, gap 0.45-0.90 m (標識令 別表第六)", `${f(zw)} m / ${f(zg)} m (${zebra.length} bars, ${crossings.length} crossings)`, zw, within(zw, 0.45, 0.5) === "ok" && within(zg, 0.45, 0.9) === "ok" ? "ok" : "off");
-  row("zebra-width", "Zebra crossing width (bar length)", ">= 4 m in principle, 3 m minimum (規制基準 p.77)", `${f(zl)} m`, zl, !Number.isFinite(zl) ? "no data" : zl >= 3.995 ? "ok" : zl >= 2.995 ? "short of 4 m" : "under 3 m");
+  row("zebra-bars", "Zebra bar width / gap (201)", "bar 0.45-0.50 m, gap 0.45-0.90 m (標識令 別表第六)", `${f(zw)} m / ${f(zg)} m (${zebra.length} bars, ${crossings.length} crossings)`, zw, within(zw, 0.45, 0.5) === "ok" && within(zg, 0.45, 0.9) === "ok" ? "ok" : "off",
+    "標識令 別表第六", { bar: zw, gap: zg, bars: zebra.length, crossings: crossings.length }, "m");
+  row("zebra-width", "Zebra crossing width (bar length)", ">= 4 m in principle, 3 m minimum (規制基準 p.77)", `${f(zl)} m`, zl, !Number.isFinite(zl) ? "no data" : zl >= 3.995 ? "ok" : zl >= 2.995 ? "short of 4 m" : "under 3 m",
+    "規制基準 p.77", { length: zl }, "m");
 
   // edge line / 路側帯 line by road class and measured width
   const carriageway = new PolyIndex(24);
@@ -275,6 +359,9 @@ export function audit(input: Input): Report {
     carriageway.add(rings.map((r) => { const pts: [number, number][] = []; for (let i = 0; i + 1 < r.length; i += 2) pts.push([r[i], r[i + 1]]); return pts; }));
   }
   const lineGrid = new Grid(8, lines);
+  // the raised footways (SIDEWALK areas: the mesher stands them on a kerb, tools/city/mesh/meshing.js)
+  const sidewalk = areaIndex(tiles, [AREA.SIDEWALK]);
+  const footway = { n: 0, kerb: 0, line: 0, neither: 0 };
   const reach = (x: number, z: number, nx: number, nz: number, s: number) => { for (let d = 0.25; d <= 18; d += 0.25) if (!carriageway.has(x + nx * d * s, z + nz * d * s)) return d; return null; };
   const tally = new Map<string, { n: number; any: number; both: number }>();
   for (const e of edges) {
@@ -295,6 +382,11 @@ export function audit(input: Input): Report {
         const t = (q.x - cx) * dx + (q.z - cz) * dz, o = (q.x - cx) * nx + (q.z - cz) * nz;
         if (Math.abs(t) <= 5.5 && Math.abs(o) >= Math.max(0.6, w / 2 - 2) && Math.abs(o) <= w / 2 + 0.3) sides.add(Math.sign(o));
       }
+      if (cls === "minor") for (const side of [1, -1]) {
+        const d = side === 1 ? R : L, kerb = sidewalk.has(x + nx * (d + 0.6) * side, z + nz * (d + 0.6) * side);
+        footway.n++;
+        if (kerb) footway.kerb++; else if (sides.has(side)) footway.line++; else footway.neither++;
+      }
       const bucket = WIDTHS.find(([a, b]) => w >= a && w < b)![2], key = cls + "|" + bucket;
       const s = tally.get(key) ?? { n: 0, any: 0, both: 0 };
       s.n++; if (sides.size) s.any++; if (sides.size === 2) s.both++;
@@ -306,7 +398,8 @@ export function audit(input: Input): Report {
   const minor = [...tally].filter(([k]) => k.startsWith("minor|")).reduce((s, [, v]) => ({ n: s.n + v.n, any: s.any + v.any }), { n: 0, any: 0 });
   const minorShare = minor.n ? minor.any / minor.n : NaN;
   row("rosoku", "路側帯 / edge line on minor roads (108 / 103)", "solid white 0.15-0.20 m, strip >= 0.5 m (標識令 別表第六; 規制基準 p.73)", `${f(minorShare * 100, 1)}% of ${f(minor.n * 10 / 1000, 1)} km sampled carry one`, minorShare,
-    !Number.isFinite(minorShare) ? "no data" : minorShare < 0.05 ? "missing" : minorShare < 0.5 ? "partial" : "present");
+    !Number.isFinite(minorShare) ? "no data" : minorShare < 0.05 ? "missing" : minorShare < 0.5 ? "partial" : "present",
+    "標識令 別表第六; 規制基準 p.73", { share: minorShare, km: minor.n * 10 / 1000 }, "share of the km sampled");
 
   // symbols
   const names = Object.fromEntries(Object.entries(DECAL as Record<string, number>).map(([k, v]) => [v, k]));
@@ -316,29 +409,34 @@ export function audit(input: Input): Report {
   const diamond = variantsLike(/DIAMOND|CROSSING_AHEAD|DIA/), yabane = variantsLike(/YABANE|CHEVRON|CYCLE|BIKE/);
   const nDiamond = decals.filter((p) => diamond.includes(p.variant)).length, nYabane = decals.filter((p) => yabane.includes(p.variant)).length;
   row("diamond", "◇ crossing-ahead marks (210)", "1.5 m wide; about 30 m before an unsignalled crossing, 1-2 more at 10-20 m (規制基準 p.79)",
-    `${nDiamond}${diamond.length ? "" : " (no DECAL variant)"}; ${unsignalled} of ${crossings.length} crossings unsignalled (>= ${unsignalled * 2} expected)`, nDiamond, nDiamond >= unsignalled * 2 && unsignalled > 0 ? "ok" : nDiamond ? "partial" : "missing");
-  row("yabane", "Cycle 矢羽根 marks", "0.75 m wide, >= 1.5 m long, every 10 m (自転車GL p.II-6-7)", `${nYabane}${yabane.length ? "" : " (no DECAL variant)"}`, nYabane, nYabane ? "present" : "missing");
+    `${nDiamond}${diamond.length ? "" : " (no DECAL variant)"}; ${unsignalled} of ${crossings.length} crossings unsignalled (>= ${unsignalled * 2} expected)`, nDiamond, nDiamond >= unsignalled * 2 && unsignalled > 0 ? "ok" : nDiamond ? "partial" : "missing",
+    "規制基準 p.79", { marks: nDiamond, unsignalled, crossings: crossings.length }, "count");
+  row("yabane", "Cycle 矢羽根 marks", "0.75 m wide, >= 1.5 m long, every 10 m (自転車GL p.II-6-7)", `${nYabane}${yabane.length ? "" : " (no DECAL variant)"}`, nYabane, nYabane ? "present" : "missing",
+    "自転車GL p.II-6-7", { marks: nYabane }, "count");
 
   if (shapes) {
     const stop = shapes.get(DECAL.STOP), speed = shapes.get(DECAL.SPEED_30), arrow = shapes.get(DECAL.THROUGH);
     if (stop) {
       const g = stopGlyphs(raster(stop.tris), cell(DECAL.STOP)), across = median(g.chars.map((c) => c.across)), along = median(g.chars.map((c) => c.along));
       row("stop-text", "止まれ character (法定外表示)", "2.4 m along x 0.8 m across, 3:1 (規制基準 p.149 図例(1))", `${f(along)} m along x ${f(across)} m across, ${f(along / across)}:1 (${g.chars.length} characters)`, along / across,
-        Math.abs(along / across - 3) < 0.3 ? "ok" : "aspect off");
-      row("stop-strokes", "止まれ strokes", "0.15 m across, 0.30 m along (規制基準 p.149)", `about ${f(g.strokeAcross)} m across, ${f(g.strokeAlong)} m along (median runs)`, g.strokeAcross, Math.abs(g.strokeAcross - 0.15) < 0.04 && Math.abs(g.strokeAlong - 0.3) < 0.06 ? "ok" : "off");
-      row("stop-length", "止まれ painted length", ">= 7.2 m (3 x 2.4 m)", `${f(g.painted)} m`, g.painted, g.painted >= 7.195 ? "ok" : "short");
+        Math.abs(along / across - 3) < 0.3 ? "ok" : "aspect off", "規制基準 p.149 図例(1)", { along, across, aspect: along / across, characters: g.chars.length }, "m");
+      row("stop-strokes", "止まれ strokes", "0.15 m across, 0.30 m along (規制基準 p.149)", `about ${f(g.strokeAcross)} m across, ${f(g.strokeAlong)} m along (median runs)`, g.strokeAcross, Math.abs(g.strokeAcross - 0.15) < 0.04 && Math.abs(g.strokeAlong - 0.3) < 0.06 ? "ok" : "off",
+        "規制基準 p.149", { across: g.strokeAcross, along: g.strokeAlong }, "m");
+      row("stop-length", "止まれ painted length", ">= 7.2 m (3 x 2.4 m)", `${f(g.painted)} m`, g.painted, g.painted >= 7.195 ? "ok" : "short", "規制基準 p.149", { length: g.painted }, "m");
     }
     if (speed) {
       const g = speedGlyphs(raster(speed.tris), cell(DECAL.SPEED_30)), d = g.digits[0];
       row("speed-digit", "Speed numeral digit (105)", "0.5 m wide x 5 m long, 0.2 m apart; \"30\" 1.2 m wide (標識令 別表第六)",
-        d ? `${f(d.across)} x ${f(d.along)} m, ${f(g.gap)} m apart; "30" ${f(g.total)} m wide (${f(d.across / 0.5)}x)` : "no digits found", d ? d.across : null, d && Math.abs(d.across - 0.5) < 0.08 && Math.abs(d.along - 5) < 0.3 ? "ok" : "off");
+        d ? `${f(d.across)} x ${f(d.along)} m, ${f(g.gap)} m apart; "30" ${f(g.total)} m wide (${f(d.across / 0.5)}x)` : "no digits found", d ? d.across : null, d && Math.abs(d.across - 0.5) < 0.08 && Math.abs(d.along - 5) < 0.3 ? "ok" : "off",
+        "標識令 別表第六", { width: d?.across, length: d?.along, gap: g.gap, total: g.total }, "m");
     }
     if (arrow) {
       const g = arrowGlyph(raster(arrow.tris), cell(DECAL.THROUGH));
       row("arrow", "Through arrow (204 / 110)", "5 m long, shaft 0.15 m, head 2.5 m long (標識令 別表第六)", `${f(g.length)} m long, shaft ${f(g.shaft)} m, head ${f(g.head)} m long x ${f(g.headWidth)} m wide`, g.head,
-        Math.abs(g.head - 2.5) < 0.2 && Math.abs(g.length - 5) < 0.3 ? "ok" : "head short");
+        Math.abs(g.head - 2.5) < 0.2 && Math.abs(g.length - 5) < 0.3 ? "ok" : "head short",
+        "標識令 別表第六", { length: g.length, shaft: g.shaft, head: g.head, headWidth: g.headWidth }, "m");
     }
-  } else row("glyphs", "Symbol shapes", "-", "not read (the decal atlas could not be drawn: needs sharp and its fonts)", null, "no data");
+  } else row("glyphs", "Symbol shapes", "-", "not read (the decal atlas could not be drawn: needs sharp and its fonts)", null, "no data", "-", {}, "-");
 
   // poles and spans
   const poles = tiles.flatMap((t) => t.props.filter((p) => p.kind === PROP.POLE && inBox(bbox, p.x, p.z)));
@@ -348,7 +446,8 @@ export function audit(input: Input): Report {
   for (const t of tiles) for (let i = 0; i + 3 < t.wires.length; i += 4) if (inBox(bbox, t.wires[i], t.wires[i + 1])) spans.push(Math.hypot(t.wires[i + 2] - t.wires[i], t.wires[i + 3] - t.wires[i + 1]));
   const ms = median(spans);
   row("pole-spacing", "Pole spacing (span length)", "about 30 m (ROADMAP 6h; no public standard found)", `spans p10 ${f(pct(spans, 0.1), 1)} / median ${f(ms, 1)} / p90 ${f(pct(spans, 0.9), 1)} m (${spans.length} spans, ${poles.length} poles; nearest pole median ${f(median(nn), 1)} m)`, ms,
-    !Number.isFinite(ms) ? "no data" : Math.abs(ms - 30) <= 5 ? "ok" : "off");
+    !Number.isFinite(ms) ? "no data" : Math.abs(ms - 30) <= 5 ? "ok" : "off",
+    "ROADMAP 6h", { p10: pct(spans, 0.1), median: ms, p90: pct(spans, 0.9), spans: spans.length, poles: poles.length, nearestPole: median(nn) }, "m");
   const spacing: { bin: string; n: number }[] = [];
   for (let b = 0; b < 60; b += 5) spacing.push({ bin: `${b}-${b + 5} m`, n: spans.filter((s) => s >= b && s < b + 5).length });
 
@@ -356,14 +455,17 @@ export function audit(input: Input): Report {
     const at = rig.conductors.map((yy) => rig.poleHeight! + yy).sort((a, b) => b - a), sag = rig.sag ? rig.sag[0] * (Number.isFinite(ms) ? ms : 30) + rig.sag[1] : 0;
     const low = Math.min(...at) - sag;
     row("cable-band", "Cable heights (near rig)", "telecom >= 5 m over a road, >= 2.5 m over a separated footway (有線電気通信設備令施行規則 第7条1号)",
-      `${[...new Set(at.map((h) => f(h, 2)))].join(" / ")} m at the pole; lowest ${f(low, 2)} m at mid-span (sag ${f(sag, 2)} m on ${f(Number.isFinite(ms) ? ms : 30, 1)} m)`, low, low > 7 ? "top band only" : low >= 5 ? "ok" : "below 5 m");
-    row("cable-count", "Cables per span (near rig)", "\"a dozen\" (ROADMAP 6h; no standard)", `${rig.conductors.length}`, rig.conductors.length, rig.conductors.length >= 10 ? "ok" : "fewer");
-  } else row("cable-band", "Cable heights (near rig)", "telecom >= 5 m over a road", "rig not found in scene/hero/dress.ts (the parser needs updating)", null, "no data");
+      `${[...new Set(at.map((h) => f(h, 2)))].join(" / ")} m at the pole; lowest ${f(low, 2)} m at mid-span (sag ${f(sag, 2)} m on ${f(Number.isFinite(ms) ? ms : 30, 1)} m)`, low, low > 7 ? "top band only" : low >= 5 ? "ok" : "below 5 m",
+      "有線電気通信設備令施行規則 第7条1号", { top: Math.max(...at), lowestAtPole: Math.min(...at), lowestMidSpan: low, sag }, "m");
+    row("cable-count", "Cables per span (near rig)", "\"a dozen\" (ROADMAP 6h; no standard)", `${rig.conductors.length}`, rig.conductors.length, rig.conductors.length >= 10 ? "ok" : "fewer", "ROADMAP 6h", { cables: rig.conductors.length }, "count");
+  } else row("cable-band", "Cable heights (near rig)", "telecom >= 5 m over a road", "rig not found in scene/hero/dress.ts (the parser needs updating)", null, "no data", "有線電気通信設備令施行規則 第7条1号", {}, "m");
   if (rig.poleHeight != null || rig.farPoleHeight != null)
     row("pole-height", "Pole height near / far, lamp near / far", "about 12 m shared poles (NTT East, secondary); near and far should agree",
       `${f(rig.poleHeight ?? NaN, 2)} / ${f(rig.farPoleHeight ?? NaN, 2)} m; lamp ${f(rig.nearLamp ?? NaN, 2)} / ${f(rig.farLamp ?? NaN, 2)} m`, rig.poleHeight,
-      rig.poleHeight != null && rig.farPoleHeight != null && Math.abs(rig.poleHeight - rig.farPoleHeight) < 0.3 && rig.nearLamp != null && rig.farLamp != null && Math.abs(rig.nearLamp - rig.farLamp) < 0.3 ? "ok" : "near and far differ");
-  return { rows, edgeLines, spacing, decals: decalCount };
+      rig.poleHeight != null && rig.farPoleHeight != null && Math.abs(rig.poleHeight - rig.farPoleHeight) < 0.3 && rig.nearLamp != null && rig.farLamp != null && Math.abs(rig.nearLamp - rig.farLamp) < 0.3 ? "ok" : "near and far differ",
+      "NTT East", { near: rig.poleHeight, far: rig.farPoleHeight, nearLamp: rig.nearLamp, farLamp: rig.farLamp }, "m");
+  const furniture = streetFurniture(tiles, edges, bbox, footway);
+  return { rows, furniture, edgeLines, spacing, decals: decalCount };
 }
 
 export function formatReport(r: Report, title: string): string {
@@ -374,12 +476,59 @@ export function formatReport(r: Report, title: string): string {
   out.push("", "Span lengths between poles:", "", "| Span | Count |", "|---|---|");
   for (const s of r.spacing) if (s.n) out.push(`| ${s.bin} | ${s.n} |`);
   out.push("", `Road symbols: ${Object.entries(r.decals).map(([k, v]) => `${k} ${v}`).join(", ") || "none"}`);
+  if (r.furniture?.length) {
+    out.push("", `The street furniture of ROADMAP 6h along minor roads (a prop counts for the nearest road centreline within ${BESIDE} m):`, "", "| Item | Standard (source) | Measured | Verdict |", "|---|---|---|---|");
+    for (const x of r.furniture) out.push(`| ${x.item} | ${x.standard} | ${x.measured} | ${x.verdict} |`);
+  }
   return out.join("\n");
+}
+
+// ---------------------------------------------------------------- before / after
+/** A report as --json writes it (rows and furniture, or rows alone). */
+export type ReportJson = { rows: Row[]; furniture?: Row[] };
+const WITHIN = new Set(["ok", "present"]);
+const g = (v: number | null | undefined) => (v == null ? "-" : Number.isInteger(v) ? String(v) : String(Number(v.toPrecision(4))));
+/** The rows whose measured values (to four significant figures, as shown) or verdict changed between two reports, as a
+ * Markdown table, and a count. "Within standard" is an "ok" or "present" verdict. */
+export function diffReports(before: ReportJson, after: ReportJson): string {
+  const all = (r: ReportJson) => [...r.rows, ...(r.furniture ?? [])];
+  const was = new Map(all(before).map((r) => [r.id, r])), now = new Map(all(after).map((r) => [r.id, r]));
+  const ids = [...now.keys(), ...[...was.keys()].filter((k) => !now.has(k))];
+  const lines: string[] = [];
+  let changed = 0, nowWithin = 0, noLonger = 0;
+  for (const id of ids) {
+    const a = was.get(id), b = now.get(id);
+    const keys = [...new Set([...Object.keys(a?.values ?? {}), ...Object.keys(b?.values ?? {})])];
+    const moved = keys.filter((k) => g(a?.values?.[k]) !== g(b?.values?.[k]));
+    if (a && b && !moved.length && a.verdict === b.verdict) continue;
+    changed++;
+    const okA = !!a && WITHIN.has(a.verdict), okB = !!b && WITHIN.has(b.verdict);
+    if (!okA && okB) nowWithin++;
+    if (okA && !okB) noLonger++;
+    const values = !a ? "(new row)" : !b ? "(row gone)" : !moved.length ? "-"
+      : moved.map((k) => `${k} ${g(a.values[k])} -> ${g(b.values[k])}`).join("; ");
+    const verdict = a?.verdict === b?.verdict ? `${b!.verdict} (same)` : `${a?.verdict ?? "-"} -> ${b?.verdict ?? "-"}`;
+    lines.push(`| ${(b ?? a)!.item} | ${values} | ${(b ?? a)!.unit} | ${b?.measured ?? "-"} | ${verdict} |`);
+  }
+  const count = `${changed} of ${ids.length} rows changed, ${nowWithin} now within standard${noLonger ? `, ${noLonger} no longer` : ""}`;
+  if (!changed) return count;
+  return ["| Item | Before -> after | Unit (lengths) | Measured after | Verdict |", "|---|---|---|---|---|", ...lines, "", count].join("\n");
 }
 
 // ---------------------------------------------------------------- command line
 async function main() {
-  const arg = (name: string) => process.argv.find((a) => a.startsWith(`--${name}=`))?.split("=")[1];
+  const argv = process.argv;
+  const arg = (name: string) => argv.find((a) => a.startsWith(`--${name}=`))?.split("=")[1];
+  const at = argv.indexOf("--diff");
+  if (at >= 0) {
+    const [a, b] = argv.slice(at + 1, at + 3);
+    if (!a || !b) { console.log("usage: street-audit.ts --diff before.json after.json"); return; }
+    console.log(diffReports(JSON.parse(readFileSync(a, "utf8")), JSON.parse(readFileSync(b, "utf8"))));
+    return;
+  }
+  // --json <file> (or --json=<file>) writes the report as data beside the Markdown; a bare --json prints it instead
+  const j = argv.indexOf("--json"), next = j >= 0 ? argv[j + 1] : undefined;
+  const jsonFile = arg("json") ?? (next && !next.startsWith("--") ? next : undefined);
   const area = arg("area") ?? "shinjuku", dir = resolve(arg("tiles") ?? join(repoRoot, "assets/city/tiles", area));
   const bb = arg("bbox")?.split(",").map(Number), bbox: Box | null = bb?.length === 4 ? { minX: bb[0], minZ: bb[1], maxX: bb[2], maxZ: bb[3] } : null;
   if (!existsSync(dir)) { console.log(`no compiled tiles at ${dir} (compile the area with tools/city first)`); return; }
@@ -398,7 +547,9 @@ async function main() {
     return [x1 - x0, z1 - z0];
   };
   const report = audit({ tiles, edges: roads.edges, signals, rig, shapes, cell, bbox });
-  if (process.argv.includes("--json")) console.log(JSON.stringify({ area, bbox, tiles: tiles.length, ...report }, null, 1));
+  const data = JSON.stringify({ area, bbox, tiles: tiles.length, ...report }, null, 1);
+  if (jsonFile) writeFileSync(jsonFile, data + "\n");
+  if (j >= 0 && !jsonFile) console.log(data);
   else console.log(formatReport(report, `${area}${bbox ? ` [${bb!.join(", ")}]` : ""}, ${tiles.length} tiles`));
 }
 if (process.argv[1] && realpathSync(resolve(process.argv[1])) === realpathSync(import.meta.filename))

@@ -3,7 +3,7 @@
 //   node tools/tokyo/street-audit.test.ts
 import assert from "node:assert/strict";
 import { AREA, PROP, DECAL } from "../city/shared/tileformat.js";
-import { audit, parseRig, type Tile } from "./street-audit.ts";
+import { audit, diffReports, parseRig, type Tile } from "./street-audit.ts";
 
 const ring = (pts: number[][]) => Float32Array.from(pts.flat());
 /** A quad along +x: from x0 to x1, centred on z, w wide. */
@@ -79,3 +79,31 @@ const boxed = audit({ tiles, edges: [], signals: [], rig, shapes: null, cell, bb
 assert.equal(boxed.rows.find((r) => r.id === "zebra-width")!.verdict, "no data");
 assert.equal(boxed.rows.find((r) => r.id === "glyphs")!.verdict, "no data");
 console.log("street-audit: ok");
+
+// the street furniture of 6h on the same street: four poles beside the residential road, no trees, the line on one side
+const furn = (id: string) => { const r = report.furniture.find((x) => x.id === id); assert.ok(r, `furniture row ${id}`); return r!; };
+assert.equal(furn("lamp-arms").values.poleLamps, 4);
+assert.equal(furn("transformers").values.count, 0);
+assert.equal(furn("street-trees").verdict, "none in the data");
+assert.equal(furn("sign-posts").verdict, "none in the data");
+near(furn("footway").values.line, 0.5, 1e-9, "sides with a white line");
+near(furn("footway").values.kerb, 0, 1e-9, "sides with a kerb");
+
+// before / after: two small reports written by hand
+const r = (id: string, values: Record<string, number | null>, verdict: string, measured = "-") =>
+  ({ id, item: id, standard: "-", source: "-", measured, value: Object.values(values)[0], values, unit: "m", verdict });
+const before = { rows: [r("lane-width", { median: 0.2, pieces: 10 }, "over"), r("dash", { dash: 5, gap: 5 }, "within 標識令, not the urban standard"), r("stop-line", { median: 0.4 }, "ok")],
+  furniture: [r("vending", { perKm: 3 }, "present"), r("sign-posts", { perKm: 0 }, "none in the data")] };
+const after = { rows: [r("lane-width", { median: 0.15, pieces: 10 }, "ok", "0.15 m"), r("dash", { dash: 6, gap: 9 }, "ok"), r("stop-line", { median: 0.40000001 }, "ok")],
+  furniture: [r("vending", { perKm: 3 }, "present"), r("sign-posts", { perKm: 2.5 }, "present")] };
+const d = diffReports(before, after);
+assert.match(d, /^\| lane-width \| median 0\.2 -> 0\.15 \| m \| 0\.15 m \| over -> ok \|$/m);
+assert.match(d, /^\| dash \| dash 5 -> 6; gap 5 -> 9 \| m \| - \| within 標識令, not the urban standard -> ok \|$/m);
+assert.match(d, /^\| sign-posts \| perKm 0 -> 2\.5 \|/m);
+assert.doesNotMatch(d, /stop-line|vending/); // unchanged to four figures, or not at all
+assert.match(d, /^3 of 5 rows changed, 3 now within standard$/m);
+assert.equal(diffReports(after, after), "0 of 5 rows changed, 0 now within standard");
+const gone = diffReports(before, { rows: after.rows.slice(0, 2), furniture: [] });
+assert.match(gone, /\| stop-line \| \(row gone\) \|/);
+assert.match(gone, /^5 of 5 rows changed, 2 now within standard, 2 no longer$/m); // stop-line, vending gone
+console.log("street-audit diff: ok");
