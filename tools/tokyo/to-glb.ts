@@ -36,6 +36,7 @@ import { WINDOW_GROUPS, WINDOW_NODES, WINDOW_SWITCH } from "../../scene/area.ts"
 import { createDraper } from "../city/mesh/drape.js";
 import { PROP } from "../city/shared/tileformat.js";
 import type { BuildingLook } from "../../scene/hero/dress.ts";
+import { farWindows, rowAt, storey, upperWindows, type FarWindows } from "./far-windows.ts";
 
 const area = (process.argv.find((a) => a.startsWith("--area=")) ?? "--area=shinjuku").split("=")[1];
 const flag = (k: string) => process.argv.find((a) => a.startsWith(`--${k}=`))?.split("=")[1];
@@ -186,13 +187,18 @@ function windowGroup(seed: number, cat: number): number {
   return Math.min(WINDOW_GROUPS - 1, Math.max(0, Math.floor((WINDOW_SWITCH.high - at) / step)));
 }
 type Soup = { pos: number[]; nor: number[] };
-function windows(bd: { position: Float32Array; normal: Float32Array; aFacade: Float32Array; aBldg: Float32Array }) {
+/** `looks`: each building's window look (far-windows.ts), in the order the mesher took them (`bd.ends`); a building
+ *  with one has its rows and its module as the near levels draw them, one without the source's grid. */
+function windows(bd: { position: Float32Array; normal: Float32Array; aFacade: Float32Array; aBldg: Float32Array; ends: ArrayLike<number> }, looks: (FarWindows | null)[] = []) {
   const glass: Soup = { pos: [], nor: [] };
   // lit windows by switch group, colour and glow
   const lit = WINDOW_NODES.map(() => LIT_COLOURS.map(() => LIT_GLOW.map((): Soup => ({ pos: [], nor: [] }))));
   let count = 0, litCount = 0;
   const n = bd.position.length / 9;
+  let bi = 0;
   for (let t = 0; t < n; t++) {
+    while (bi < bd.ends.length && t * 3 >= bd.ends[bi]) bi++;
+    const fw = looks[bi] ?? null;
     const kind = bd.aBldg[t * 12 + 2], bay = bd.aBldg[t * 12 + 3];
     if (kind !== KIND.WALL || bay <= 0.5) continue;
     const height = bd.aBldg[t * 12], cat = bd.aBldg[t * 12 + 1] % 8, floorH = bd.aFacade[t * 12 + 2], seed = Math.round(bd.aFacade[t * 12 + 3] * 4096);
@@ -209,14 +215,22 @@ function windows(bd: { position: Float32Array; normal: Float32Array; aFacade: Fl
     // the triangle counter-clockwise in (u, v)
     const tri = det > 0 ? UV : [UV[0], UV[2], UV[1]];
     const u0 = Math.min(...UV.map((p) => p[0])), u1 = Math.max(...UV.map((p) => p[0])), v0 = Math.min(...UV.map((p) => p[1])), v1 = Math.max(...UV.map((p) => p[1]));
-    for (let row = Math.max(0, Math.floor(v0 / floorH)); row * floorH < v1; row++) {
+    // (with a look: its storeys, a 4 m ground floor and the rest under the parapet, as the dress splits the wall)
+    const rows = fw ? [rowAt(fw, Math.max(0, v0)), rowAt(fw, v1)] : [Math.max(0, Math.floor(v0 / floorH)), Math.ceil(v1 / floorH) - 1];
+    for (let row = rows[0]; row <= rows[1]; row++) {
       for (let col = Math.floor(u0); col < u1; col++) {
         const shop = row === 0 && cat > 1.5 && cat < 3.5;
-        const r = shop ? SHOP_RECT : WINDOW_RECT[cat > 4.5 ? 5 : cat > 3.5 ? 4 : cat < 0.5 ? 0 : -1] ?? OFFICE_RECT;
-        const wy0 = (row + r[2]) * floorH, wy1 = (row + r[3]) * floorH;
-        if (wy0 < 0 || wy1 > height - 0.9) continue;
-        if (cat < 2.5 && !shop && hash(seed, col + 41, row) < 0.2) continue; // a plain bay
-        let poly = [[col + r[0], wy0], [col + r[1], wy0], [col + r[1], wy1], [col + r[0], wy1]];
+        const rects: number[][] = [];
+        if (fw && row > 0) for (const r of upperWindows(fw, row, bay)) rects.push(r);
+        else {
+          const r = shop ? SHOP_RECT : WINDOW_RECT[cat > 4.5 ? 5 : cat > 3.5 ? 4 : cat < 0.5 ? 0 : -1] ?? OFFICE_RECT;
+          const [fy, fh] = fw ? storey(fw, 0) : [row * floorH, floorH];
+          if (!fw && cat < 2.5 && !shop && hash(seed, col + 41, row) < 0.2) continue; // a plain bay
+          rects.push([r[0], r[1], fy + r[2] * fh, fy + r[3] * fh]);
+        }
+        for (const [ru0, ru1, wy0, wy1] of rects) {
+        if (wy0 < 0 || wy1 > height - (fw ? 0.3 : 0.9)) continue;
+        let poly = [[col + ru0, wy0], [col + ru1, wy0], [col + ru1, wy1], [col + ru0, wy1]];
         for (let e = 0; e < 3 && poly.length; e++) poly = clipEdge(poly, tri[e], tri[(e + 1) % 3]);
         if (poly.length < 3) continue;
         const light = roomLight(seed, col, row, cat, height, shop), on = light !== null;
@@ -224,9 +238,10 @@ function windows(bd: { position: Float32Array; normal: Float32Array; aFacade: Fl
         const w = poly.map((p) => world(p[0], p[1]));
         for (let i = 1; i + 1 < w.length; i++) for (const p of [w[0], w[i], w[i + 1]]) { dst.pos.push(...p); dst.nor.push(...nrm); }
         // (a window clipped by two triangles counts twice: counted where its lower-left corner lies)
-        const cu = col + r[0], cv = wy0;
+        const cu = col + ru0, cv = wy0;
         const inside = clipEdge(clipEdge(clipEdge([[cu, cv], [cu + 1e-4, cv], [cu, cv + 1e-4]], tri[0], tri[1]), tri[1], tri[2]), tri[2], tri[0]).length > 0;
         if (inside) { count++; if (on) litCount++; }
+        }
       }
     }
   }
@@ -274,11 +289,12 @@ const curtainGlass = (name: string): Omit<Material, "name"> => ({ color: albedo(
 function setLooks(tile: ReturnType<typeof decodeTile>, file: string) {
   if (!looks) return;
   let id = firstId.get(file) ?? 0;
-  for (const b of tile.buildings as { polygons: Float32Array[][]; look?: { wall: number[]; curtain: string | null } }[]) {
+  for (const b of tile.buildings as { polygons: Float32Array[][]; look?: { wall: number[]; curtain: string | null; windows: FarWindows | null } }[]) {
     let first = -1;
     for (const p of b.polygons) if (p[0]) { if (first < 0) first = id; id++; }
     const l = looks.looks[first];
-    if (l) b.look = { wall: albedo(l.curtain ? l.curtain.spandrel : l.wall), curtain: l.curtain?.glass ?? null };
+    // (and its windows: the near levels' module and storeys; the mesher takes its bay)
+    if (l) b.look = { wall: albedo(l.curtain ? l.curtain.spandrel : l.wall), curtain: l.curtain?.glass ?? null, windows: farWindows(l) };
   }
 }
 /** The far level's trees by tile and quadrant ("x_z_q"): each a form and its frame (props.ts `treeCopies`). */
@@ -408,7 +424,7 @@ async function cityTile(tile: ReturnType<typeof decodeTile>, tl: Manifest["tiles
         const K = Number(kind);
         return { name: k, color: fromQuant(qq.split(",").map(Number)), roughness: K === KIND.LATTICE ? 0.5 : K === KIND.WALL ? 0.8 : 0.88, metallic: 0 };
       }, B);
-      const w = windows(bd);
+      const w = windows(bd, gb.map((b) => (b as { look?: { windows: FarWindows | null } }).look?.windows ?? null));
       const put = (sp: Soup, mat: Material, node: string) => {
         if (!sp.pos.length) return;
         const pos = Float32Array.from(sp.pos), nor = Float32Array.from(sp.nor);
