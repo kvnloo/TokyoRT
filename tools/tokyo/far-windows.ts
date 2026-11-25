@@ -1,17 +1,29 @@
 // The far level's windows in the near levels' module (to-glb.ts `windows`): a building's storeys split as the dress
 // splits its walls, and an upper storey's windows in one bay drawn as scene/hero/dress.ts `dressMid` draws them (a
 // ribbon across an office's floors, else the building's single / pair / triple / tall / wide module). So the window
-// rows do not move and the bands do not change at the 480 m switch. A curtain wall keeps the far level's own grid.
+// rows do not move and the bands do not change at the 480 m switch. A curtain wall as `curtainFloor` draws it: on each
+// storey the spandrel band its own height over the slab, the vision glass above it up to the transom.
 import type { BuildingLook } from "../../scene/hero/dress.ts";
 
 /** What the far level needs of a building's look for its windows (`b.look.windows`, from looks.json). */
-export type FarWindows = BuildingLook["windows"] & BuildingLook["floors"] & { ribbon: boolean };
+export type FarWindows = BuildingLook["windows"] & BuildingLook["floors"] & { ribbon: boolean; spandrelH?: number };
 
-/** The window look of a building without a curtain wall; null when looks.json is older than its `floors`. */
+/** A building's window look; null when looks.json is older than its `floors`. A curtain wall has its spandrels' height. */
 export function farWindows(l: BuildingLook): FarWindows | null {
-  if (l.curtain || !l.floors || !l.windows.bay) return null;
+  if (!l.floors || !l.windows.bay) return null;
+  if (l.curtain) return { ...l.windows, ...l.floors, ribbon: false, spandrelH: l.curtain.spandrelH };
   // (an office's floors are always a ribbon, whatever the module drew: `dressMid`)
   return { ...l.windows, ...l.floors, ribbon: l.kind === "office" || l.windows.layout === "ribbon" };
+}
+
+/** A curtain wall's vision glass in one bay `bw` m wide on a storey, as `curtainFloor` (upper floors) and the lobby
+ *  (the ground floor) draw it: [u0, u1, v0, v1]. A fin 6 cm wide between bays; on an upper floor the spandrel panel
+ *  (`spandrelH`, at most 40 % of the storey) over the slab and a 4 cm transom under the next; the lobby's glass from the
+ *  ground to 0.35 m under the first floor. */
+export function curtainWindows(fw: FarWindows, row: number, bw: number): [number, number, number, number][] {
+  const [fy, fh] = storey(fw, row), m = Math.min(0.2, 0.03 / bw);
+  const [wy0, wy1] = row === 0 ? [fy, fy + fh - 0.35] : [fy + Math.min(fw.spandrelH ?? 0, fh * 0.4), fy + fh - 0.04];
+  return wy1 - wy0 > 0.5 ? [[m, 1 - m, wy0, wy1]] : [];
 }
 
 /** The storey a height above the base is in (0: the ground floor). */

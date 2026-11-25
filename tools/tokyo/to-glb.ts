@@ -36,7 +36,7 @@ import { WINDOW_GROUPS, WINDOW_NODES, WINDOW_SWITCH } from "../../scene/area.ts"
 import { createDraper } from "../city/mesh/drape.js";
 import { PROP } from "../city/shared/tileformat.js";
 import type { BuildingLook } from "../../scene/hero/dress.ts";
-import { farWindows, rowAt, storey, upperWindows, type FarWindows } from "./far-windows.ts";
+import { curtainWindows, farWindows, rowAt, storey, upperWindows, type FarWindows } from "./far-windows.ts";
 
 const area = (process.argv.find((a) => a.startsWith("--area=")) ?? "--area=shinjuku").split("=")[1];
 const flag = (k: string) => process.argv.find((a) => a.startsWith(`--${k}=`))?.split("=")[1];
@@ -221,7 +221,8 @@ function windows(bd: { position: Float32Array; normal: Float32Array; aFacade: Fl
       for (let col = Math.floor(u0); col < u1; col++) {
         const shop = row === 0 && cat > 1.5 && cat < 3.5;
         const rects: number[][] = [];
-        if (fw && row > 0) for (const r of upperWindows(fw, row, bay)) rects.push(r);
+        if (fw?.spandrelH !== undefined) for (const r of curtainWindows(fw, row, bay)) rects.push(r);
+        else if (fw && row > 0) for (const r of upperWindows(fw, row, bay)) rects.push(r);
         else {
           const r = shop ? SHOP_RECT : WINDOW_RECT[cat > 4.5 ? 5 : cat > 3.5 ? 4 : cat < 0.5 ? 0 : -1] ?? OFFICE_RECT;
           const [fy, fh] = fw ? storey(fw, 0) : [row * floorH, floorH];
@@ -266,9 +267,10 @@ const cityLevel = process.argv.includes("--city");
 const seams = cityLevel ? seamsOf(area) : [];
 if (seams.length) console.log(`${area}: seams ${seams.map((q) => `${"xyz"[q.axis]} ${q.sign > 0 ? "<=" : ">="} ${q.at}`).join(", ")}`);
 // The near levels' looks (looks.json, tools/tokyo/city-bake.ts): a building far away keeps the wall colour the dress gave
-// it near, and a tower its curtain wall (the windows a curtain grid, the wall between them its spandrels' colour).
+// it near, and a tower its curtain wall (its storeys' vision glass, the wall between them its spandrels: their colour,
+// and their polish, a metal panel's, as the dress has them).
 // Ids are the tiles' buildings in city-bake's order (the files sorted, a building's polygons each one).
-type Looks = { looks: Record<string, BuildingLook>; materials: Record<string, { albedo: number[] }> };
+type Looks = { looks: Record<string, BuildingLook>; materials: Record<string, { albedo: number[]; roughness?: number; metalness?: number }> };
 const looksFile = join(city, "baked", area, "looks.json");
 const looks: Looks | null = cityLevel && existsSync(looksFile) ? JSON.parse(readFileSync(looksFile, "utf8")) : null;
 const firstId = new Map<string, number>();
@@ -284,17 +286,23 @@ const albedo = (name: string) => (looks!.materials[name]?.albedo ?? [0.5, 0.5, 0
 /** A tower's vision glass far away: the dress's curtain glass (tinted, the rooms behind it) as an opaque pane of its
  *  colour at the brightness it reads by day. */
 const CURTAIN_FAR = 0.35;
+/** The curtain glass the far level uses, and what it lets through (its linear colour: the dress's glass transmits it
+ *  all, tinted): the scene's rooms behind a far tower's panes by day are that much dimmer, as they are near. */
+const curtains: Record<string, number[]> = {};
 const curtainGlass = (name: string): Omit<Material, "name"> => ({ color: albedo(name).map((v) => v * CURTAIN_FAR) as [number, number, number], roughness: 0.04, ior: 1.5 });
+/** How a wall of a tower's spandrels reflects (looks.json: the dress's spandrel material); a wall of an older looks.json
+ *  is matt. */
+const spandrelFinish = (name: string) => ({ roughness: looks!.materials[name]?.roughness ?? 0.8, metallic: looks!.materials[name]?.metalness ?? 0 });
 /** Each building's look (`b.look`, read by the mesher) from looks.json, before any filter changes the order. */
 function setLooks(tile: ReturnType<typeof decodeTile>, file: string) {
   if (!looks) return;
   let id = firstId.get(file) ?? 0;
-  for (const b of tile.buildings as { polygons: Float32Array[][]; look?: { wall: number[]; curtain: string | null; windows: FarWindows | null } }[]) {
+  for (const b of tile.buildings as { polygons: Float32Array[][]; look?: { wall: number[]; curtain: string | null; spandrel: string | null; windows: FarWindows | null } }[]) {
     let first = -1;
     for (const p of b.polygons) if (p[0]) { if (first < 0) first = id; id++; }
     const l = looks.looks[first];
     // (and its windows: the near levels' module and storeys; the mesher takes its bay)
-    if (l) b.look = { wall: albedo(l.curtain ? l.curtain.spandrel : l.wall), curtain: l.curtain?.glass ?? null, windows: farWindows(l) };
+    if (l) b.look = { wall: albedo(l.curtain ? l.curtain.spandrel : l.wall), curtain: l.curtain?.glass ?? null, spandrel: l.curtain?.spandrel ?? null, windows: farWindows(l) };
   }
 }
 /** The far level's trees by tile and quadrant ("x_z_q"): each a form and its frame (props.ts `treeCopies`). */
@@ -417,13 +425,21 @@ async function cityTile(tile: ReturnType<typeof decodeTile>, tl: Manifest["tiles
     mq ??= m1;
     const bd = m1.buildings;
     if (bd.position.length) {
+      // (a curtain wall's walls are its spandrels: each triangle's building from the mesher's ends)
+      const spandrelOf = (tri: number) => {
+        if (!curtain) return null;
+        let lo = 0, hi = bd.ends.length - 1;
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (tri * 3 >= bd.ends[mid]) lo = mid + 1; else hi = mid; }
+        return (gb[lo] as { look?: { spandrel: string | null } } | undefined)?.look?.spandrel ?? null;
+      };
       soupTo(g, bd, (tri) => {
-        const kind = bd.aBldg[tri * 12 + 2], c = colorOf(bd.color, tri);
-        return kind === KIND.LATTICE && Math.max(...c) > 1 ? `lamp ${c.map((v) => v.toFixed(2)).join(",")}` : `bldg ${kind} ${quant(c).join(",")}`;
+        const kind = bd.aBldg[tri * 12 + 2], c = colorOf(bd.color, tri), sp = kind === KIND.WALL ? spandrelOf(tri) : null;
+        return kind === KIND.LATTICE && Math.max(...c) > 1 ? `lamp ${c.map((v) => v.toFixed(2)).join(",")}` : `bldg ${kind} ${quant(c).join(",")}${sp ? ` ${sp}` : ""}`;
       }, (k) => {
         if (k.startsWith("lamp ")) return towerLamp(k.split(" ")[1].split(",").map(Number)).map((e) => ({ node: `${B}-${e.node}`, material: e.material }));
-        const [, kind, qq] = k.split(" ");
+        const [, kind, qq, ...sp] = k.split(" ");
         const K = Number(kind);
+        if (sp.length) return { name: k, color: fromQuant(qq.split(",").map(Number)), ...spandrelFinish(sp.join(" ")) };
         return { name: k, color: fromQuant(qq.split(",").map(Number)), roughness: K === KIND.LATTICE ? 0.5 : K === KIND.WALL ? 0.8 : 0.88, metallic: 0 };
       }, B);
       const w = windows(bd, gb.map((b) => (b as { look?: { windows: FarWindows | null } }).look?.windows ?? null));
@@ -435,7 +451,9 @@ async function cityTile(tile: ReturnType<typeof decodeTile>, tl: Manifest["tiles
       const glass: Omit<Material, "name"> = { color: [0.02, 0.022, 0.025], roughness: 0.04, ior: 1.5 };
       put(w.glass, curtain ? { name: `window glass ${curtain}`, ...curtainGlass(curtain) } : { name: "window glass", ...glass }, B);
       // (unlit: seen, lighting nothing; a far city's 1.3 M window triangles out of the light list)
-      w.lit.forEach((group) => group.forEach((bins, i) => bins.forEach((sp, j) => put(sp, { name: `window lit far ${i} ${j}`, ...glass, emissive: LIT_COLOURS[i], emissiveStrength: LIT_NITS * LIT_GLOW[j], unlit: true }, `${B}-night`))));
+      // (a curtain wall's in their own, which the scene sees its room through by day: "window lit curtain <glass>")
+      w.lit.forEach((group) => group.forEach((bins, i) => bins.forEach((sp, j) => put(sp, { name: curtain ? `window lit curtain ${curtain} ${i} ${j}` : `window lit far ${i} ${j}`, ...glass, emissive: LIT_COLOURS[i], emissiveStrength: LIT_NITS * LIT_GLOW[j], unlit: true }, `${B}-night`))));
+      if (curtain) curtains[curtain] = albedo(curtain);
       totals.windows += w.count;
       totals.litWindows += w.litCount;
     }
@@ -623,7 +641,7 @@ if (only) {
 if (cityLevel) {
   const trees = writeTrees(outDir);
   console.log(`${area}: ${trees} far trees as copies of ${TREE_FORMS.length} forms -> trees.bin`);
-  writeFileSync(join(outDir, "index.json"), JSON.stringify({ area, tileSize: size, bounds: manifest.bounds, tiles: index, triangles: totals.triangles }, null, 1) + "\n");
+  writeFileSync(join(outDir, "index.json"), JSON.stringify({ area, tileSize: size, bounds: manifest.bounds, tiles: index, triangles: totals.triangles, curtains }, null, 1) + "\n");
   console.log(`${area} (city far level): ${totals.tiles} tiles, ${(totals.triangles / 1e6).toFixed(2)} M triangles, ${(totals.bytes / 1e6).toFixed(0)} MB in ${((Date.now() - t0) / 1000).toFixed(0)} s -> ${outDir}`);
   process.exit(0);
 }
